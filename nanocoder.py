@@ -32,6 +32,12 @@ except ImportError:  # pragma: no cover - Windows without pyreadline
 VERSION = "0.1.0"
 DEFAULT_MODEL = "qwen2.5-coder:7b"
 DEFAULT_BASE_URL = "http://localhost:11434/v1"
+# local servers probed by --base-url auto (name, url); override with NANOCODER_BACKENDS="name=url,..."
+KNOWN_BACKENDS = [("ollama", "http://127.0.0.1:11434/v1"), ("llama.cpp", "http://127.0.0.1:8080/v1"),
+                  ("llama.cpp", "http://127.0.0.1:8081/v1"), ("llama.cpp", "http://127.0.0.1:8082/v1"),
+                  ("llama.cpp", "http://127.0.0.1:8083/v1"), ("vllm", "http://127.0.0.1:8000/v1"),
+                  ("sglang", "http://127.0.0.1:30000/v1"), ("lmstudio", "http://127.0.0.1:1234/v1")]
+BENCH_CACHE = os.path.expanduser("~/.nanocoder/bench.json")
 IGNORED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "env", "dist", "build",
                 ".next", ".mypy_cache", ".pytest_cache", ".idea", ".vscode", "target", ".tox"}
 PROJECT_NOTES = ("NANOCODER.md", "AGENTS.md", "CLAUDE.md")
@@ -290,6 +296,9 @@ class LLM:
         self.api_key, self.temperature = api_key, temperature
         self.partial = ""
         self.usage = None
+        self.max_tokens = None
+        self.backend = ""     # which local server was picked (auto mode)
+        self.pinned = False   # True when the user gave an explicit URL for this model
 
     def _req(self, path: str, body=None, timeout: float = 900):
         headers = {"Content-Type": "application/json"}
@@ -316,6 +325,8 @@ class LLM:
                 "temperature": self.temperature, "stream_options": {"include_usage": True}}
         if tools:
             body["tools"] = tools
+        if self.max_tokens:
+            body["max_tokens"] = self.max_tokens
         router = TagRouter(sink)
         content, calls, got, rest = "", {}, False, []
         self.partial = ""
@@ -1111,6 +1122,146 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
         w(dim(f"✻ Conversation compacted (~{self.est_tokens()} tokens)\n"))
 
 
+# ─────────────────────────── backend auto-selection ─────────────────────────
+
+def canon(name: str) -> str:
+    """Normalize model ids across servers: 'qwen2.5-coder:7b', 'Qwen/Qwen2.5-Coder-7B-Instruct' and
+    'qwen2.5-coder-7b-instruct-q4_k_m.gguf' all become 'qwen2.5-coder-7b'."""
+    s = name.lower().strip().rsplit("/", 1)[-1].replace(":", "-").replace("_", "-")
+    s = re.sub(r"\.gguf$", "", s)
+    s = re.sub(r"-\d{5}-of-\d{5}$", "", s)
+    s = re.sub(r"-(i?q\d[\w-]*|f16|bf16|fp16|fp8|int4|int8|awq|gptq|\d+bit)$", "", s)
+    s = re.sub(r"-(instruct|chat|it|latest)(?=-|$)", "", s)
+    return s
+
+
+def discover(timeout: float = 0.5) -> list:
+    """Probe local OpenAI-compatible servers in parallel. Returns [{name, url, models}]."""
+    raw = os.environ.get("NANOCODER_BACKENDS")
+    specs = [tuple(x.strip().split("=", 1)) for x in raw.split(",") if "=" in x] if raw else KNOWN_BACKENDS
+    found = [None] * len(specs)
+
+    def probe(i, name, url):
+        try:
+            with LLM(url, "")._req("/models", timeout=timeout) as r:
+                data = json.load(r).get("data", [])
+        except (LLMError, ValueError, OSError):
+            return
+        owner = next((m.get("owned_by") for m in data if m.get("owned_by")), "")
+        name = {"llamacpp": "llama.cpp", "vllm": "vllm", "sglang": "sglang"}.get(owner, name)
+        found[i] = {"name": name, "url": url, "models": [m.get("id", "") for m in data if m.get("id")]}
+
+    threads = [threading.Thread(target=probe, args=(i, n, u), daemon=True) for i, (n, u) in enumerate(specs)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout + 1)
+    return [f for f in found if f]
+
+
+BENCH_MSGS = [{"role": "system", "content": "You are a careful coding agent. " + "Follow the project's conventions. " * 60},
+              {"role": "user", "content": "Write a Python function is_prime(n). Reply with code only."}]
+
+
+def bench(url: str, model: str) -> dict:
+    """Time one small agent-like request: score = time to first token + time for 64 tokens."""
+    llm = LLM(url, model)
+    llm.max_tokens = 1
+    llm.chat([{"role": "user", "content": "hi"}], None, lambda *_: None)  # load the model first
+    llm.max_tokens = 48
+    t0, first, chars = time.time(), [0.0], [0]
+
+    def sink(mode, text):
+        first[0] = first[0] or time.time()
+        chars[0] += len(text)
+    llm.chat(BENCH_MSGS, None, sink)
+    end = time.time()
+    start = first[0] or end
+    toks = (llm.usage or {}).get("completion_tokens") or max(1, chars[0] // 4)
+    rate = toks / max(1e-3, end - start)
+    return {"score": (start - t0) + 64 / rate, "rate": rate, "ttft": start - t0, "at": time.time()}
+
+
+def _load_cache() -> dict:
+    try:
+        with open(BENCH_CACHE) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_cache(cache: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(BENCH_CACHE), exist_ok=True)
+        with open(BENCH_CACHE, "w") as fh:
+            json.dump(cache, fh, indent=1)
+    except OSError:
+        pass
+
+
+def pick_backend(model: str, backends: list, cache: dict, rebench: bool = False):
+    """Find every server that has `model`; if several, benchmark (cached a week) and pick the fastest."""
+    want = canon(model)
+    cands = [(b, mid) for b in backends for mid in b["models"] if mid == model or canon(mid) == want]
+    if not cands:
+        return None
+    if len(cands) == 1:
+        return cands[0][0], cands[0][1], ""
+    scored = []
+    for b, mid in cands:
+        key = f"{b['url']}|{mid}"
+        c = cache.get(key)
+        if rebench or not c or time.time() - c.get("at", 0) > 7 * 86400:
+            w(dim(f"  ✻ benchmarking {model} on {b['name']}…\n"))
+            try:
+                c = cache[key] = bench(b["url"], mid)
+            except LLMError as e:
+                w(dim(f"    skipped: {clip(str(e), 80)}\n"))
+                continue
+        scored.append((c["score"], b, mid, c))
+    if not scored:
+        return cands[0][0], cands[0][1], ""
+    _, b, mid, c = min(scored, key=lambda x: x[0])
+    return b, mid, f"fastest of {len(scored)}, {c['rate']:.0f} tok/s"
+
+
+def auto_setup(agent: Agent, rebench: bool = False) -> None:
+    """--base-url auto: route every role (refiner, orchestrator, workers) to the fastest local server."""
+    backends = discover()
+    if not backends:
+        w(yellow("  ! no local model server found.") + dim(" Start one, e.g. `ollama serve` or "
+                                                         "`llama-server -m model.gguf --jinja`\n"))
+        return
+    cache = _load_cache()
+
+    def route(llm: LLM) -> bool:
+        if llm.pinned:
+            return True
+        hit = pick_backend(llm.model, backends, cache, rebench)
+        if not hit:
+            return False
+        b, mid, why = hit
+        llm.base_url, llm.model = b["url"], mid
+        llm.backend = b["name"] + (f" · {why}" if why else "")
+        return True
+
+    if not route(agent.llm):
+        have = sorted({m for b in backends for m in b["models"]})
+        w(yellow(f"  ! model '{agent.llm.model}' is not on any local server.")
+          + dim(f" Found: {', '.join(have[:8]) or '-'}\n"))
+        agent.llm.base_url = backends[0]["url"]
+    if agent.refiner and not route(agent.refiner):
+        w(dim(f"  ! prompt refiner disabled (not on any server): {agent.refiner.model}\n"))
+        agent.refiner = None
+    gone = [t for t, llm in agent.workers.items() if not route(llm)]
+    if gone:
+        w(dim("  ! sub-agents disabled (not on any server): "
+              + ", ".join(f"{t}={agent.workers[t].model}" for t in gone) + "\n"))
+    agent.workers = {t: llm for t, llm in agent.workers.items() if t not in gone}
+    set_workers(agent, agent.workers)
+    _save_cache(cache)
+
+
 # ───────────────────────────────── REPL ────────────────────────────────────
 
 HELP = """\
@@ -1125,11 +1276,12 @@ HELP = """\
   /tokens        show context usage
   /team          show the sub-agent team
   /refine        toggle the prompt refiner
+  /backends      list local model servers and benchmark results
   /exit          quit (or ctrl+d)
   !<command>     run a shell command; its output goes into context
   @path          attach a file to your message
   line ending with \\  continue on the next line"""
-COMMANDS = ["/help", "/clear", "/compact", "/init", "/model", "/models", "/yolo", "/think", "/tokens", "/team", "/refine", "/exit"]
+COMMANDS = ["/help", "/clear", "/compact", "/init", "/model", "/models", "/yolo", "/think", "/tokens", "/team", "/refine", "/backends", "/exit"]
 INIT_PROMPT = ("Explore this project (structure, languages, build/test commands, conventions) and write a "
                "concise NANOCODER.md at the project root that will help a coding agent work here. "
                "If it already exists, improve it.")
@@ -1145,12 +1297,16 @@ def prompt_str(s: str) -> str:
 
 def banner(agent: Agent) -> None:
     rows = [f"{orange('✻')} {bold('nanocoder')} {dim('v' + VERSION)}", "",
-            f"  {dim('model')}  {agent.llm.model}", f"  {dim('server')} {agent.llm.base_url}",
+            f"  {dim('model')}  {agent.llm.model}" + (dim(f"  [{agent.llm.backend}]") if agent.llm.backend else ""),
+            f"  {dim('server')} {agent.llm.base_url}",
             f"  {dim('cwd')}    {agent.cwd}"]
     if agent.refiner:
-        rows.append(f"  {dim('brief')}  {agent.refiner.model}")
+        rows.append(f"  {dim('brief')}  {agent.refiner.model}"
+                    + (dim(f"  [{agent.refiner.backend.split(' ·')[0]}]") if agent.refiner.backend else ""))
     if agent.workers:
-        rows.append(f"  {dim('team')}   " + " · ".join(f"{t} {llm.model}" for t, llm in agent.workers.items()))
+        rows.append(f"  {dim('team')}   " + " · ".join(
+            f"{t} {llm.model}" + (dim(f" [{llm.backend.split(' ·')[0]}]") if llm.backend else "")
+            for t, llm in agent.workers.items()))
     rows += ["",
             dim("  /help for commands · @file to attach · !cmd for shell")]
     inner = min(term_width() - 4, max(vlen(r) for r in rows) + 2)
@@ -1204,6 +1360,7 @@ def parse_workers(specs: list, base_url: str, api_key: str) -> dict:
                 raise SystemExit(f"nanocoder: bad worker spec '{item}', expected TIER=MODEL[@BASE_URL]")
             model, _, url = model.strip().partition("@")
             out[tier.strip()] = LLM(url or base_url, model, api_key)
+            out[tier.strip()].pinned = bool(url)
     return out
 
 
@@ -1256,6 +1413,14 @@ def command(agent: Agent, line: str) -> bool:
     elif cmd == "/think":
         agent.show_think = not agent.show_think
         w(dim(f"✻ Showing reasoning: {'on' if agent.show_think else 'off'}\n"))
+    elif cmd == "/backends":
+        cache = _load_cache()
+        for b in discover():
+            w(f"  {bold(b['name'])} {dim(b['url'])}\n")
+            for m in b["models"]:
+                c = cache.get(f"{b['url']}|{m}")
+                w(f"    {m}" + (dim(f"  {c['rate']:.0f} tok/s, first token {c['ttft']:.1f}s") if c else "") + "\n")
+        w(dim("  (rerun nanocoder with --rebench to measure again)\n"))
     elif cmd == "/refine":
         if agent.refiner:
             agent.parked_refiner, agent.refiner = agent.refiner, None
@@ -1316,8 +1481,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="nanocoder", description="A tiny local coding agent for your terminal.")
     ap.add_argument("prompt", nargs="*", help="run one prompt non-interactively and exit")
     ap.add_argument("-m", "--model", default=env("NANOCODER_MODEL", DEFAULT_MODEL))
-    ap.add_argument("--base-url", default=env("NANOCODER_BASE_URL", DEFAULT_BASE_URL),
-                    help="OpenAI-compatible API base URL (default: Ollama)")
+    ap.add_argument("--base-url", default=env("NANOCODER_BASE_URL", "auto"),
+                    help="OpenAI-compatible API base URL, or 'auto' (default) to find local servers "
+                         "and use the fastest one for each model")
+    ap.add_argument("--rebench", action="store_true", help="re-measure backend speed (auto mode)")
     ap.add_argument("--api-key", default=env("NANOCODER_API_KEY", ""))
     ap.add_argument("-y", "--yolo", action="store_true", help="auto-approve edits and commands")
     ap.add_argument("--text-tools", action="store_true",
@@ -1336,26 +1503,38 @@ def main(argv=None) -> int:
     ap.add_argument("--version", action="version", version=f"nanocoder {VERSION}")
     args = ap.parse_args(argv)
 
+    auto = args.base_url == "auto"
+    base = DEFAULT_BASE_URL if auto else args.base_url
     specs = [] if args.no_workers else (args.worker or [env("NANOCODER_WORKERS", DEFAULT_WORKERS)])
-    workers = parse_workers(specs, args.base_url, args.api_key)
+    workers = parse_workers(specs, base, args.api_key)
     refiner = None
     if not args.no_refiner and args.refiner:
         model, _, url = args.refiner.partition("@")
-        refiner = LLM(url or args.base_url, model, args.api_key, temperature=0.1)
-    agent = Agent(LLM(args.base_url, args.model, args.api_key), args.cwd, yolo=args.yolo,
+        refiner = LLM(url or base, model, args.api_key, temperature=0.1)
+        refiner.pinned = bool(url)
+    chef = LLM(base, args.model, args.api_key)
+    chef.pinned = not auto
+    agent = Agent(chef, args.cwd, yolo=args.yolo,
                   text_tools=args.text_tools, ctx_limit=args.ctx, workers=workers, refiner=refiner)
 
     prompt = " ".join(args.prompt)
     if not prompt and not sys.stdin.isatty():
         prompt = sys.stdin.read().strip()
+    def connect():
+        auto_setup(agent, args.rebench) if auto else check_server(agent)
+
     if prompt:
-        check_server(agent)
+        connect()
         agent.turn(prompt)
         return 0
 
     setup_readline()
-    banner(agent)
-    check_server(agent)
+    if auto:
+        connect()
+        banner(agent)
+    else:
+        banner(agent)
+        connect()
     while True:
         try:
             line = read_input(agent)
