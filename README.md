@@ -94,7 +94,7 @@ Böylece şefin context'i şişmez.
 | `large` | `qwen2.5-coder:3b` | okuma + düzenleme + komut |
 
 ```bash
-ollama pull qwen2.5-coder:7b qwen2.5-coder:0.5b qwen2.5-coder:1.5b qwen2.5-coder:3b
+for m in 7b 0.5b 1.5b 3b; do ollama pull qwen2.5-coder:$m; done
 OLLAMA_MAX_LOADED_MODELS=4 OLLAMA_CONTEXT_LENGTH=32768 ollama serve
 
 nanocoder -w small=qwen3:0.6b -w medium=qwen3:1.7b          # kendi ekibini kur
