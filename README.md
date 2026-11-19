@@ -31,7 +31,9 @@ Dosya okur, arar, düzenler, komut çalıştırır. Bunları yapmadan önce sana
 - **Otomatik compaction**: context dolunca konuşmayı özetler
 - `@dosya` ile dosya ekleme, `!komut` ile shell, proje notları için `NANOCODER.md` (`AGENTS.md`/`CLAUDE.md` da okunur)
 - Ctrl+C her zaman güvenli, konuşma geçmişi bozulmaz
+- **Prompt düzenleyici**: ayrı bir model mesajını netleştirip "bunları yapma" listesiyle şefe iletir
 - **Ajan ekibi**: büyük bir "şef" model planlar, küçük modellere iş dağıtır (aşağıda)
+- **Fine-tune edilmiş işçi modeller**: nanocoder'ın tool akışına özel eğitilmiş LoRA adapter'ları (aşağıda)
 
 ## Kurulum
 
@@ -77,8 +79,39 @@ nanocoder --base-url http://localhost:1234/v1   # LM Studio
 | `/yolo` | otomatik onayı açar/kapatır |
 | `/think` | modelin düşüncelerini gösterir/gizler |
 | `/tokens` | context kullanımını gösterir |
+| `/team` | düzenleyiciyi, şefi ve işçileri gösterir |
+| `/refine` | prompt düzenleyiciyi açar/kapatır |
 | `!ls -la` | shell komutu çalıştırır, çıktısı bir sonraki mesajla modele gider |
 | `@src/main.py` | dosyayı mesaja ekler |
+
+## Akış
+
+```
+sen ──▶ düzenleyici (qwen3.5:9b) ──brief──▶ şef (qwen2.5-coder:7b) ──task──▶ işçiler (0.5b / 1.5b / 3b)
+```
+
+## Prompt düzenleyici
+
+Her mesajın önce düzenleyici modele gider. Düzenleyici mesajı şu formatta bir brief'e çevirir:
+
+```
+GOAL: ne isteniyor
+DETAILS: somut gereksinimler, tahminler "(assumed)" diye işaretli
+DO NOT: bu iş için yapılmaması gerekenler (alakasız dosyalara dokunma, bağımlılık ekleme...)
+DONE WHEN: işin bittiği nasıl anlaşılır
+REPLY LANGUAGE: hangi dilde cevap verilecek
+```
+
+Brief, orijinal mesajının altına eklenip şefe gider. Çelişki olursa senin yazdığın kazanır.
+"evet", "devam" gibi kısa mesajlar düzenleyiciye uğramadan geçer.
+
+```bash
+ollama pull qwen3.5:9b
+nanocoder -r gemma2:9b       # başka bir düzenleyici
+nanocoder --no-refiner       # düzenleyici kapalı
+```
+
+Oturum içinde `/refine` ile açıp kapatabilirsin.
 
 ## Ajan ekibi (orkestratör + sub-agent'lar)
 
