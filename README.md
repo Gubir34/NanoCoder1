@@ -123,6 +123,7 @@ sen ──▶ düzenleyici (qwen3.5:9b) ──brief──▶ şef (qwen2.5-coder
 Her mesajın önce düzenleyici modele gider. Düzenleyici mesajı şu formatta bir brief'e çevirir:
 
 ```
+REQUEST (English): mesajının birebir İngilizce çevirisi (kod, dosya adı, hata mesajı aynen kalır)
 GOAL: ne isteniyor
 DETAILS: somut gereksinimler, tahminler "(assumed)" diye işaretli
 DO NOT: bu iş için yapılmaması gerekenler (alakasız dosyalara dokunma, bağımlılık ekleme...)
@@ -131,6 +132,10 @@ REPLY LANGUAGE: hangi dilde cevap verilecek
 ```
 
 Brief, orijinal mesajının altına eklenip şefe gider. Çelişki olursa senin yazdığın kazanır.
+
+**Dil akışı**: Türkçe (ya da başka bir dilde) yazarsın, düzenleyici isteği İngilizceye çevirir. Şef işçilere görevleri
+İngilizce verir, çünkü küçük işçiler İngilizce veriyle eğitildi ve 0.5B'nin Türkçesi kırık. Şef sana cevabı
+`REPLY LANGUAGE`'da, yani Türkçe yazarsan Türkçe verir.
 "evet", "devam" gibi kısa mesajlar düzenleyiciye uğramadan geçer.
 
 ```bash
@@ -214,24 +219,44 @@ Bunun için `finetune/` altında uçtan uca bir hat var:
 Çözüm bu iki satırı ayrı, yüksek learning rate ile eğitmek (`trainable_token_indices`). Eğitim sonunda bir
 "ilk token" kontrolü var, ortalama loss bir daha böyle bir hatayı saklayamaz.
 
-**Sonuçlar** (30 görev: dosya bulma, kullanım arama, özetleme, bug düzeltme, rename, sabit değiştirme, fonksiyon ekleme):
+İşçiler iki tür veriyle eğitildi:
 
-| Model | Başarı | Tool hatası |
-|---|---|---|
-| `qwen2.5-coder:0.5b` (ham) | 0/30 | – (hiç tool çağıramıyor) |
-| `agentcoder-worker:0.5b` | **26–28/30** (3 koşu) | 0–7 |
+- **Agentic**: 800 tool akışı örneği (`gen_data.py`) + 280 "repoya fonksiyon ekle, testleri koş" örneği (`code_data.py`, MBPP problemlerinden)
+- **Düz kod**: 284 MBPP çözümü. Referans çözümlerle (çıplak kod) eğitince model kodlamadan önce yazdığı kısa açıklamayı
+  bıraktı ve MBPP'de 43'ten 39'a düştü. Çözüm `distill_code.py`: 1.5B öğretmen her problemi kendi açıklamasıyla
+  çözüyor, sadece testleri **geçen** cevaplar veriye giriyor (468 problemin 284'ü, rejection sampling)
+
+MBPP kodları sandbox'ta çalışır (`python -I`, geçici dizin, timeout, izinli import listesi). Eval MBPP'nin test bölümünde,
+eğitim train/validation/prompt bölümlerinde.
+
+**Sonuçlar** (agentic: 30 görev, dosya bulma, kullanım arama, özetleme, bug düzeltme, rename, sabit değiştirme, fonksiyon ekleme;
+MBPP: test bölümünün ilk 100 problemi, pass@1, greedy):
+
+| Model | Agentic | Tool hatası | MBPP |
+|---|---|---|---|
+| `qwen2.5-coder:0.5b` (ham) | 0/30 | – (hiç tool çağıramıyor) | 40/100 |
+| `agentcoder-worker:0.5b` v1 (sadece agentic veri) | 26–28/30 (3 koşu) | 0–7 | 43/100 |
+| + çıplak MBPP kodu | 27/30 | 0 | 39/100 |
+| **`agentcoder-worker:0.5b`** (agentic + distill kod) | **27/30** | 1 | **44/100** |
+| `qwen2.5-coder:1.5b` (ham, referans) | – | – | 62/100 |
 
 Okuma/arama/küçük düzeltme görevlerinde neredeyse kusursuz. Zayıf olduğu yer yeni fonksiyon yazmak
 (0/2): kodu yanlış yazıp "testler geçti" diyor. 0.5B'den mucize beklemeyin, o yüzden `small` rolü zaten salt okunur.
-Not: eval görevleri eğitimle aynı dağılımdan (farklı seed'ler), yani bu "agentcoder'ın tool akışını öğrendi mi"
-ölçümü, genel zeka testi değil.
+Not: agentic eval görevleri eğitimle aynı dağılımdan (farklı seed'ler), yani bu "agentcoder'ın tool akışını öğrendi mi"
+ölçümü, genel zeka testi değil. MBPP ise eğitimde görülmemiş problemler.
 
 ```bash
 python finetune/gen_data.py --n 800 --seed 1 --out finetune/data/train.jsonl
-python finetune/train.py --base Qwen/Qwen2.5-Coder-0.5B-Instruct --data finetune/data/train.jsonl \
-    --out finetune/adapters/my-worker            # 4 çekirdek CPU'da ~1 saat
+python finetune/code_data.py --mbpp /path/to/mbpp --out finetune/data/code.jsonl   # MBPP parquet dosyaları
+agentcoder-server --model teacher=Qwen/Qwen2.5-Coder-1.5B-Instruct &
+python finetune/distill_code.py --mbpp /path/to/mbpp --model teacher --out finetune/data/code_distill.jsonl  # ~3 saat
+python -c "import json; open('finetune/data/code_agent.jsonl','w').writelines(l for l in open('finetune/data/code.jsonl') if json.loads(l)['kind']=='code_agent')"
+python finetune/train.py --base Qwen/Qwen2.5-Coder-0.5B-Instruct \
+    --data finetune/data/train.jsonl,finetune/data/code_agent.jsonl,finetune/data/code_distill.jsonl \
+    --out finetune/adapters/my-worker            # 4 çekirdek CPU'da ~2 saat
 agentcoder-server --model w=Qwen/Qwen2.5-Coder-0.5B-Instruct+finetune/adapters/my-worker &
 python finetune/eval.py --url http://127.0.0.1:8090/v1 --model w --n 30
+python finetune/code_eval.py --mbpp /path/to/mbpp --model w --n 100
 python finetune/export_ollama.py --adapter finetune/adapters/my-worker   # Ollama'ya aktar (opsiyonel)
 ```
 
