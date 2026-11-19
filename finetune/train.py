@@ -56,7 +56,8 @@ def decision_check(model, tok, data):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="Qwen/Qwen2.5-Coder-0.5B-Instruct")
-    ap.add_argument("--data", default="finetune/data/train.jsonl")
+    ap.add_argument("--data", default="finetune/data/train.jsonl",
+                    help="JSONL file(s), comma-separated; they are shuffled together")
     ap.add_argument("--out", default="finetune/adapters/agentcoder-worker-0.5b")
     ap.add_argument("--epochs", type=float, default=1.0)
     ap.add_argument("--lr", type=float, default=2e-4)
@@ -72,7 +73,8 @@ def main():
     torch.manual_seed(0)
 
     tok = AutoTokenizer.from_pretrained(args.base)
-    samples = [json.loads(line) for line in open(args.data)]
+    samples = [json.loads(line) for path in args.data.split(",") for line in open(path)]
+    random.Random(0).shuffle(samples)
     if args.limit:
         samples = samples[: args.limit]
     data = []
