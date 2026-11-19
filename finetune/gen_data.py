@@ -1,6 +1,6 @@
-"""Generate fine-tuning trajectories for nanocoder worker agents.
+"""Generate fine-tuning trajectories for agentcoder worker agents.
 
-Each sample: a fresh synthetic repo + task, solved by a scripted teacher that calls nanocoder's
+Each sample: a fresh synthetic repo + task, solved by a scripted teacher that calls agentcoder's
 real tools (so tool outputs are exactly what the model will see at inference). Samples that fail
 their own check are dropped.
 
@@ -18,10 +18,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
-import nanocoder as nc  # noqa: E402
+import agentcoder as nc  # noqa: E402
 from tasks import sample_task  # noqa: E402
 
-nc.w = lambda s: None  # silence nanocoder's terminal output
+nc.w = lambda s: None  # silence agentcoder's terminal output
 
 
 class NullLLM:
@@ -30,7 +30,7 @@ class NullLLM:
 
 
 class Env:
-    """Runs teacher tool calls through a real nanocoder sub-agent and records the transcript."""
+    """Runs teacher tool calls through a real agentcoder sub-agent and records the transcript."""
 
     def __init__(self, root, tier, prompt):
         self.agent = nc.Agent(NullLLM(), root, yolo=True, role=tier)

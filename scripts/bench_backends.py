@@ -1,4 +1,4 @@
-"""Benchmark OpenAI-compatible inference servers the way nanocoder uses them.
+"""Benchmark OpenAI-compatible inference servers the way agentcoder uses them.
 
 For each server: a cold request with a ~1.5k-token agent prompt (cache-busted), then an agent-style
 follow-up that appends a tool result to the same conversation (tests prefix caching).
@@ -14,7 +14,7 @@ import time
 import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import nanocoder as nc  # noqa: E402
+import agentcoder as nc  # noqa: E402
 
 TASK = "Write a Python module with a function parse_duration(s) that turns strings like '1h30m', '45s', " \
        "'2d4h' into seconds, with docstrings and input validation. Output only the code."

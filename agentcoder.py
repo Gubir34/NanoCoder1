@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""nanocoder - a tiny, local, terminal coding agent.
+"""AgentCoder - a tiny, local, terminal coding agent.
 
 Talks to any OpenAI-compatible server (Ollama, LM Studio, llama.cpp, vLLM, ...).
 Zero dependencies: just Python 3.8+.
@@ -32,15 +32,15 @@ except ImportError:  # pragma: no cover - Windows without pyreadline
 VERSION = "0.1.0"
 DEFAULT_MODEL = "qwen2.5-coder:7b"
 DEFAULT_BASE_URL = "http://localhost:11434/v1"
-# local servers probed by --base-url auto (name, url); override with NANOCODER_BACKENDS="name=url,..."
+# local servers probed by --base-url auto (name, url); override with AGENTCODER_BACKENDS="name=url,..."
 KNOWN_BACKENDS = [("ollama", "http://127.0.0.1:11434/v1"), ("llama.cpp", "http://127.0.0.1:8080/v1"),
                   ("llama.cpp", "http://127.0.0.1:8081/v1"), ("llama.cpp", "http://127.0.0.1:8082/v1"),
                   ("llama.cpp", "http://127.0.0.1:8083/v1"), ("vllm", "http://127.0.0.1:8000/v1"),
                   ("sglang", "http://127.0.0.1:30000/v1"), ("lmstudio", "http://127.0.0.1:1234/v1")]
-BENCH_CACHE = os.path.expanduser("~/.nanocoder/bench.json")
+BENCH_CACHE = os.path.expanduser("~/.agentcoder/bench.json")
 IGNORED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "env", "dist", "build",
                 ".next", ".mypy_cache", ".pytest_cache", ".idea", ".vscode", "target", ".tox"}
-PROJECT_NOTES = ("NANOCODER.md", "AGENTS.md", "CLAUDE.md")
+PROJECT_NOTES = ("AGENTCODER.md", "AGENTS.md", "CLAUDE.md")
 MAX_TOOL_OUTPUT = 20_000
 MAX_STEPS = 40
 SUB_MAX_STEPS = 20
@@ -605,7 +605,7 @@ class Agent:
             entries = []
         listing = ", ".join(e + ("/" if os.path.isdir(os.path.join(self.cwd, e)) else "")
                             for e in entries[:60]) or "(empty)"
-        p = f"""You are nanocoder, a small but sharp coding agent running in the user's terminal. \
+        p = f"""You are AgentCoder, a small but sharp coding agent running in the user's terminal. \
 You solve software engineering tasks by reading, searching and editing files and running commands with your tools.
 
 # Environment
@@ -695,7 +695,7 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
             self.spinner.stop()
             self.repair_history()
             ensure_nl()
-            w(red("  ⎿  Interrupted") + dim(" · tell nanocoder what to do instead\n"))
+            w(red("  ⎿  Interrupted") + dim(" · tell AgentCoder what to do instead\n"))
         except LLMError as e:
             self.spinner.stop()
             self.repair_history()
@@ -870,7 +870,7 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
                 w(bar + line + "\n")
             return
         if not sys.stdin.isatty():
-            raise ToolDenied("Permission denied: not interactive (run nanocoder with --yolo to auto-approve).")
+            raise ToolDenied("Permission denied: not interactive (run agentcoder with --yolo to auto-approve).")
         if self.role:
             title = f"[{self.role} agent] {title}"
         w(self.ind + orange("  ╭─ ") + bold(title) + "\n")
@@ -1137,7 +1137,7 @@ def canon(name: str) -> str:
 
 def discover(timeout: float = 0.5) -> list:
     """Probe local OpenAI-compatible servers in parallel. Returns [{name, url, models}]."""
-    raw = os.environ.get("NANOCODER_BACKENDS")
+    raw = os.environ.get("AGENTCODER_BACKENDS")
     specs = [tuple(x.strip().split("=", 1)) for x in raw.split(",") if "=" in x] if raw else KNOWN_BACKENDS
     found = [None] * len(specs)
 
@@ -1268,7 +1268,7 @@ HELP = """\
   /help          show this help
   /clear         start a fresh conversation
   /compact       summarize the conversation to free up context
-  /init          analyze the project and write NANOCODER.md notes
+  /init          analyze the project and write AGENTCODER.md notes
   /model [name]  show or switch the model
   /models        list models available on the server
   /yolo          toggle auto-approve for edits and commands
@@ -1283,7 +1283,7 @@ HELP = """\
   line ending with \\  continue on the next line"""
 COMMANDS = ["/help", "/clear", "/compact", "/init", "/model", "/models", "/yolo", "/think", "/tokens", "/team", "/refine", "/backends", "/exit"]
 INIT_PROMPT = ("Explore this project (structure, languages, build/test commands, conventions) and write a "
-               "concise NANOCODER.md at the project root that will help a coding agent work here. "
+               "concise AGENTCODER.md at the project root that will help a coding agent work here. "
                "If it already exists, improve it.")
 
 
@@ -1296,8 +1296,8 @@ def prompt_str(s: str) -> str:
 
 
 def banner(agent: Agent) -> None:
-    rows = [f"{orange('✻')} {bold('nanocoder')} {dim('v' + VERSION)}", "",
-            f"  {dim('model')}  {agent.llm.model}" + (dim(f"  [{agent.llm.backend}]") if agent.llm.backend else ""),
+    rows = [f"{orange('✻')} {bold('AgentCoder')} {dim('v' + VERSION)}", "",
+            f"  {dim('model')}  {agent.llm.model.rsplit('/', 1)[-1]}" + (dim(f"  [{agent.llm.backend}]") if agent.llm.backend else ""),
             f"  {dim('server')} {agent.llm.base_url}",
             f"  {dim('cwd')}    {agent.cwd}"]
     if agent.refiner:
@@ -1357,7 +1357,7 @@ def parse_workers(specs: list, base_url: str, api_key: str) -> dict:
         for item in filter(None, (x.strip() for x in spec.split(","))):
             tier, eq, model = item.partition("=")
             if not eq or not tier.strip() or not model.strip():
-                raise SystemExit(f"nanocoder: bad worker spec '{item}', expected TIER=MODEL[@BASE_URL]")
+                raise SystemExit(f"agentcoder: bad worker spec '{item}', expected TIER=MODEL[@BASE_URL]")
             model, _, url = model.strip().partition("@")
             out[tier.strip()] = LLM(url or base_url, model, api_key)
             out[tier.strip()].pinned = bool(url)
@@ -1420,7 +1420,7 @@ def command(agent: Agent, line: str) -> bool:
             for m in b["models"]:
                 c = cache.get(f"{b['url']}|{m}")
                 w(f"    {m}" + (dim(f"  {c['rate']:.0f} tok/s, first token {c['ttft']:.1f}s") if c else "") + "\n")
-        w(dim("  (rerun nanocoder with --rebench to measure again)\n"))
+        w(dim("  (rerun agentcoder with --rebench to measure again)\n"))
     elif cmd == "/refine":
         if agent.refiner:
             agent.parked_refiner, agent.refiner = agent.refiner, None
@@ -1449,7 +1449,7 @@ def command(agent: Agent, line: str) -> bool:
 def setup_readline() -> None:
     if not readline:
         return
-    hist = os.path.expanduser("~/.nanocoder_history")
+    hist = os.path.expanduser("~/.agentcoder_history")
     try:
         readline.read_history_file(hist)
     except OSError:
@@ -1478,34 +1478,34 @@ def _save_history(path: str) -> None:
 
 def main(argv=None) -> int:
     env = os.environ.get
-    ap = argparse.ArgumentParser(prog="nanocoder", description="A tiny local coding agent for your terminal.")
+    ap = argparse.ArgumentParser(prog="agentcoder", description="A tiny local coding agent for your terminal.")
     ap.add_argument("prompt", nargs="*", help="run one prompt non-interactively and exit")
-    ap.add_argument("-m", "--model", default=env("NANOCODER_MODEL", DEFAULT_MODEL))
-    ap.add_argument("--base-url", default=env("NANOCODER_BASE_URL", "auto"),
+    ap.add_argument("-m", "--model", default=env("AGENTCODER_MODEL", DEFAULT_MODEL))
+    ap.add_argument("--base-url", default=env("AGENTCODER_BASE_URL", "auto"),
                     help="OpenAI-compatible API base URL, or 'auto' (default) to find local servers "
                          "and use the fastest one for each model")
     ap.add_argument("--rebench", action="store_true", help="re-measure backend speed (auto mode)")
-    ap.add_argument("--api-key", default=env("NANOCODER_API_KEY", ""))
+    ap.add_argument("--api-key", default=env("AGENTCODER_API_KEY", ""))
     ap.add_argument("-y", "--yolo", action="store_true", help="auto-approve edits and commands")
     ap.add_argument("--text-tools", action="store_true",
                     help="describe tools in the prompt (for models without native tool calling)")
-    ap.add_argument("--ctx", type=int, default=int(env("NANOCODER_CTX", "32768")),
+    ap.add_argument("--ctx", type=int, default=int(env("AGENTCODER_CTX", "32768")),
                     help="context window size in tokens, used for auto-compaction")
     ap.add_argument("-w", "--worker", action="append", metavar="TIER=MODEL",
                     help="sub-agent model, repeatable, e.g. -w small=qwen2.5-coder:0.5b "
                          f"(default: {DEFAULT_WORKERS}; tier 'small' is read-only)")
     ap.add_argument("--no-workers", action="store_true", help="single agent, no sub-agents")
-    ap.add_argument("-r", "--refiner", default=env("NANOCODER_REFINER", DEFAULT_REFINER), metavar="MODEL",
+    ap.add_argument("-r", "--refiner", default=env("AGENTCODER_REFINER", DEFAULT_REFINER), metavar="MODEL",
                     help="model that rewrites your prompt into a brief for the orchestrator "
                          "(MODEL or MODEL@BASE_URL)")
     ap.add_argument("--no-refiner", action="store_true", help="send prompts to the orchestrator as-is")
     ap.add_argument("-C", "--cwd", default=os.getcwd(), help="project directory")
-    ap.add_argument("--version", action="version", version=f"nanocoder {VERSION}")
+    ap.add_argument("--version", action="version", version=f"agentcoder {VERSION}")
     args = ap.parse_args(argv)
 
     auto = args.base_url == "auto"
     base = DEFAULT_BASE_URL if auto else args.base_url
-    specs = [] if args.no_workers else (args.worker or [env("NANOCODER_WORKERS", DEFAULT_WORKERS)])
+    specs = [] if args.no_workers else (args.worker or [env("AGENTCODER_WORKERS", DEFAULT_WORKERS)])
     workers = parse_workers(specs, base, args.api_key)
     refiner = None
     if not args.no_refiner and args.refiner:

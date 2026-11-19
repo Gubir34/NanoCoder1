@@ -1,8 +1,8 @@
 """Minimal OpenAI-compatible server for a HF model (+ optional LoRA adapter). No Ollama needed.
 
     python finetune/serve.py --base Qwen/Qwen2.5-Coder-0.5B-Instruct \
-        --adapter finetune/adapters/nanocoder-worker-0.5b --name nanocoder-worker --port 8080
-    nanocoder --base-url http://localhost:8080/v1 -m nanocoder-worker
+        --adapter finetune/adapters/agentcoder-worker-0.5b --name agentcoder-worker --port 8080
+    agentcoder --base-url http://localhost:8080/v1 -m agentcoder-worker
 
 Greedy decoding, tool calls parsed from Qwen-style <tool_call> blocks. One request at a time.
 """

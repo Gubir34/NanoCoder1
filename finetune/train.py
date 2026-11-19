@@ -1,7 +1,7 @@
-"""LoRA fine-tuning of a small model on nanocoder worker trajectories. Runs fine on CPU (bf16).
+"""LoRA fine-tuning of a small model on agentcoder worker trajectories. Runs fine on CPU (bf16).
 
     python finetune/train.py --base Qwen/Qwen2.5-Coder-0.5B-Instruct --data finetune/data/train.jsonl \
-        --out finetune/adapters/nanocoder-worker-0.5b
+        --out finetune/adapters/agentcoder-worker-0.5b
 
 Only assistant turns are trained. The prompt prefix (system + tools + task) runs without
 gradients and is reused as a KV cache, which roughly halves the cost per sample.
@@ -42,7 +42,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="Qwen/Qwen2.5-Coder-0.5B-Instruct")
     ap.add_argument("--data", default="finetune/data/train.jsonl")
-    ap.add_argument("--out", default="finetune/adapters/nanocoder-worker-0.5b")
+    ap.add_argument("--out", default="finetune/adapters/agentcoder-worker-0.5b")
     ap.add_argument("--epochs", type=float, default=1.0)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--accum", type=int, default=4)

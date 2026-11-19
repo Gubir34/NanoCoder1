@@ -1,6 +1,6 @@
-"""Evaluate a model as a nanocoder sub-agent on held-out synthetic tasks.
+"""Evaluate a model as an AgentCoder sub-agent on held-out synthetic tasks.
 
-Runs nanocoder's real agent loop against any OpenAI-compatible server and checks the outcome
+Runs agentcoder's real agent loop against any OpenAI-compatible server and checks the outcome
 (repo state + final report). Seeds differ from training data, so every repo/task is unseen.
 
     python finetune/eval.py --url http://localhost:8080/v1 --model local --n 30 --out results.json
@@ -18,7 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
-import nanocoder as nc  # noqa: E402
+import agentcoder as nc  # noqa: E402
 from tasks import sample_task  # noqa: E402
 
 nc.w = lambda s: None

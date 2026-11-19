@@ -1,7 +1,7 @@
-"""Synthetic mini-repos + sub-agent tasks used to fine-tune and evaluate nanocoder worker models.
+"""Synthetic mini-repos + sub-agent tasks used to fine-tune and evaluate agentcoder worker models.
 
 Every task knows its ground truth, so it comes with:
-  - a scripted *teacher* that solves it with nanocoder's real tools (used to make training data)
+  - a scripted *teacher* that solves it with agentcoder's real tools (used to make training data)
   - a *check* that verifies the repo state / final report (used for data validation and eval)
 """
 from __future__ import annotations

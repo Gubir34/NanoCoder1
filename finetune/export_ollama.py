@@ -1,9 +1,9 @@
-"""Merge a nanocoder LoRA adapter into its base model and import it into Ollama.
+"""Merge an AgentCoder LoRA adapter into its base model and import it into Ollama.
 
-    python finetune/export_ollama.py --adapter finetune/adapters/nanocoder-worker-0.5b \
-        --base Qwen/Qwen2.5-Coder-0.5B-Instruct --name nanocoder-worker:0.5b
+    python finetune/export_ollama.py --adapter finetune/adapters/agentcoder-worker-0.5b \
+        --base Qwen/Qwen2.5-Coder-0.5B-Instruct --name agentcoder-worker:0.5b
 
-Then: nanocoder -w small=nanocoder-worker:0.5b
+Then: agentcoder -w small=agentcoder-worker:0.5b
 """
 import argparse
 import os
@@ -60,7 +60,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--adapter", required=True)
     ap.add_argument("--base", default="Qwen/Qwen2.5-Coder-0.5B-Instruct")
-    ap.add_argument("--name", default="nanocoder-worker:0.5b")
+    ap.add_argument("--name", default="agentcoder-worker:0.5b")
     ap.add_argument("--out", help="where to write the merged model (default: build/<name>)")
     ap.add_argument("--quantize", default="q8_0", help="ollama --quantize level, or 'none'")
     args = ap.parse_args()
@@ -89,7 +89,7 @@ def main():
     if args.quantize != "none":
         cmd += ["--quantize", args.quantize]
     subprocess.run(cmd, cwd=out, check=True)
-    print(f"done. Use it with:  nanocoder -w small={args.name}")
+    print(f"done. Use it with:  agentcoder -w small={args.name}")
 
 
 if __name__ == "__main__":
