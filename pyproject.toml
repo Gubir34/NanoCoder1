@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanocoder"
+version = "0.1.0"
+description = "A tiny local coding agent for your terminal"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+nanocoder = "nanocoder:main"
+
+[tool.setuptools]
+py-modules = ["nanocoder"]
