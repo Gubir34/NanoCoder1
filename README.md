@@ -229,19 +229,28 @@ Bunun için `finetune/` altında uçtan uca bir hat var:
 MBPP kodları sandbox'ta çalışır (`python -I`, geçici dizin, timeout, izinli import listesi). Eval MBPP'nin test bölümünde,
 eğitim train/validation/prompt bölümlerinde.
 
-**Sonuçlar** (agentic: 30 görev, dosya bulma, kullanım arama, özetleme, bug düzeltme, rename, sabit değiştirme, fonksiyon ekleme;
-MBPP: test bölümünün ilk 100 problemi, pass@1, greedy):
+**Sonuçlar.** Agentic eval: dosya bulma, kullanım arama, özetleme, bug düzeltme, rename, sabit değiştirme ve fonksiyon
+ekleme görevleri. MBPP: test bölümü, pass@1, greedy.
 
-| Model | Agentic | Tool hatası | MBPP |
+| Model | Agentic (90) | Tool hatası | MBPP (495) |
 |---|---|---|---|
-| `qwen2.5-coder:0.5b` (ham) | 0/30 | – (hiç tool çağıramıyor) | 40/100 |
-| `agentcoder-worker:0.5b` v1 (sadece agentic veri) | 26–28/30 (3 koşu) | 0–7 | 43/100 |
-| + çıplak MBPP kodu | 27/30 | 0 | 39/100 |
-| **`agentcoder-worker:0.5b`** (agentic + distill kod) | **27/30** | 1 | **44/100** |
-| `qwen2.5-coder:1.5b` (ham, referans) | – | – | 62/100 |
+| `agentcoder-worker:0.5b` v1 (sadece agentic veri) | 79/90 | 16 | 171 (%34.5) |
+| **`agentcoder-worker:0.5b`** (agentic + distill kod) | **80/90** | **6** | **191 (%38.6)** |
+
+MBPP farkı eşleştirilmiş testte anlamlı: 45 problemi sadece yeni model çözüyor, 25'ini sadece eski (işaret testi p≈0.02).
+Fonksiyon ekleme 2/9'dan 4/9'a çıktı. İlk denemeler daha küçük setteydi (30 görev / 100 problem). Orada 1–2 puanlık
+farklar gürültüydü, fp16 yuvarlaması bile o kadar oynatıyor. Büyük eval o yüzden şart:
+
+| Model | Agentic (30) | MBPP (100) |
+|---|---|---|
+| `qwen2.5-coder:0.5b` (ham) | 0/30 (hiç tool çağıramıyor) | 40 |
+| v1 | 26–28/30 (3 koşu) | 43 |
+| v1 + çıplak MBPP kodu | 27/30 | 39 |
+| yeni | 26–27/30 (fp32/fp16) | 42–44 |
+| `qwen2.5-coder:1.5b` (ham, referans) | – | 62 |
 
 Okuma/arama/küçük düzeltme görevlerinde neredeyse kusursuz. Zayıf olduğu yer yeni fonksiyon yazmak
-(0/2): kodu yanlış yazıp "testler geçti" diyor. 0.5B'den mucize beklemeyin, o yüzden `small` rolü zaten salt okunur.
+(4/9): bazen kodu yanlış yazıp "testler geçti" diyor. 0.5B'den mucize beklemeyin, o yüzden `small` rolü zaten salt okunur.
 Not: agentic eval görevleri eğitimle aynı dağılımdan (farklı seed'ler), yani bu "agentcoder'ın tool akışını öğrendi mi"
 ölçümü, genel zeka testi değil. MBPP ise eğitimde görülmemiş problemler.
 
