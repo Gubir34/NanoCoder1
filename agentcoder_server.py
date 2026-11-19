@@ -3,8 +3,9 @@
 
 Agents resend the whole conversation every turn. This server keeps the KV cache of the last
 request per model and only computes the new suffix, so a 3k-token agent turn usually costs a few
-hundred tokens of prefill. Runs HF models in bf16 (fast on CPUs with AMX/AVX512-BF16, or on a GPU),
-optionally with a LoRA adapter merged in.
+hundred tokens of prefill. On CPU, prefill runs with bf16 weights (fast with AMX/AVX512-BF16) and
+decoding with int8 weights (decode is memory-bound, int8 halves the bytes). Works on a GPU too.
+LoRA adapters are merged in at load time.
 
     pip install torch transformers peft
     python agentcoder_server.py \
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import re
 import threading
 import time
@@ -25,8 +27,45 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
+# All inference runs on the main thread: OpenMP thread pools are per calling thread, and a fresh
+# HTTP thread per request would rebuild them every time (~30% slower decoding).
+JOBS: "queue.Queue" = queue.Queue()
+
 CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", re.S)
 TAG = "<tool_call>"
+
+
+class DualLinear(torch.nn.Module):
+    """bf16 weights for prefill (compute-bound, AMX-friendly) + int8 weights for decode (bandwidth-bound).
+
+    Decode reads every weight once per token, so halving the bytes nearly doubles tokens/s on CPU.
+    Weights are per-channel int8, activations are quantized dynamically at full range; on Qwen2.5 this
+    gives the same greedy tokens as bf16 in our tests.
+    """
+
+    def __init__(self, lin: torch.nn.Linear, state: dict):
+        super().__init__()
+        self.lin, self.state = lin, state
+        w = lin.weight.detach().float()
+        scale = (w.abs().amax(1) / 127).clamp(min=1e-8).double()
+        qw = torch.quantize_per_channel(w, scale, torch.zeros_like(scale, dtype=torch.long), 0, torch.qint8)
+        self.packed = torch.ops.quantized.linear_prepack(qw, None if lin.bias is None else lin.bias.detach().float())
+
+    def forward(self, x):
+        if not self.state["decode"]:
+            return self.lin(x)
+        return torch.ops.quantized.linear_dynamic(x.float(), self.packed, False).to(x.dtype)
+
+
+def add_int8_decode(module: torch.nn.Module, state: dict) -> int:
+    n = 0
+    for name, child in module.named_children():
+        if isinstance(child, torch.nn.Linear):
+            setattr(module, name, DualLinear(child, state))
+            n += 1
+        else:
+            n += add_int8_decode(child, state)
+    return n
 
 
 def pick_device(name: str) -> str:
@@ -40,9 +79,9 @@ def pick_device(name: str) -> str:
 
 
 class Engine:
-    """One model + its prefix cache. Requests are serialized per engine."""
+    """One model + its prefix cache. Requests are serialized on the main thread."""
 
-    def __init__(self, name: str, source: str, device: str):
+    def __init__(self, name: str, source: str, device: str, int8: bool = True):
         base, _, adapter = source.partition("+")
         self.name, self.device = name, device
         self.tok = AutoTokenizer.from_pretrained(base)
@@ -51,14 +90,21 @@ class Engine:
             from peft import PeftModel
             model = PeftModel.from_pretrained(model, adapter).merge_and_unload()
         self.model = model.to(device).eval()
+        self.mode = {"decode": False}
+        self.int8 = False
+        if int8 and device == "cpu" and "fbgemm" in torch.backends.quantized.supported_engines:
+            torch.backends.quantized.engine = "fbgemm"
+            with torch.no_grad():
+                add_int8_decode(self.model, self.mode)
+            self.int8 = True
         self.stop_ids = {i for i in (self.tok.eos_token_id, self.tok.convert_tokens_to_ids("<|im_end|>"),
                                      self.tok.convert_tokens_to_ids("<|endoftext|>")) if isinstance(i, int)}
-        self.lock = threading.Lock()
         self.cached_ids: list = []
         self.cache = None
         self.stats = {"requests": 0, "prompt_tokens": 0, "reused_tokens": 0}
 
     def _forward(self, ids: list):
+        self.mode["decode"] = len(ids) == 1
         x = torch.tensor([ids], device=self.device)
         out = self.model(input_ids=x, past_key_values=self.cache, use_cache=True)
         self.cache = out.past_key_values
@@ -207,9 +253,14 @@ def make_handler(engines: dict, default_max: int):
                 self.end_headers()
                 chunk({"role": "assistant", "content": ""})
             t0 = time.time()
-            with eng.lock:
-                text, sent, n_in, n_out, reused = eng.generate(
-                    prompt, max_tokens, temperature, (lambda t: chunk({"content": t})) if stream else (lambda t: None))
+            job = {"run": lambda: eng.generate(prompt, max_tokens, temperature,
+                                               (lambda t: chunk({"content": t})) if stream else (lambda t: None)),
+                   "done": threading.Event()}
+            JOBS.put(job)
+            job["done"].wait()
+            if "error" in job:
+                raise job["error"]
+            text, sent, n_in, n_out, reused = job["result"]
             content, calls = split_calls(text)
             usage = {"prompt_tokens": n_in, "completion_tokens": n_out, "total_tokens": n_in + n_out,
                      "prompt_tokens_details": {"cached_tokens": reused}}
@@ -243,6 +294,7 @@ def main():
     ap.add_argument("--device", default="auto", help="auto, cpu, cuda, mps")
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--no-int8", action="store_true", help="decode with bf16 weights instead of int8 (CPU only)")
     args = ap.parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
@@ -253,10 +305,19 @@ def main():
         if not eq:
             name, source = spec.rsplit("/", 1)[-1], spec
         t0 = time.time()
-        engines[name] = Engine(name, source, device)
-        print(f"loaded {name} from {source} on {device} in {time.time() - t0:.0f}s", flush=True)
+        engines[name] = Engine(name, source, device, int8=not args.no_int8)
+        extra = " · int8 decode" if engines[name].int8 else ""
+        print(f"loaded {name} from {source} on {device}{extra} in {time.time() - t0:.0f}s", flush=True)
     print(f"AgentCoder Server on http://{args.host}:{args.port}/v1 · models: {', '.join(engines)}", flush=True)
-    ThreadingHTTPServer((args.host, args.port), make_handler(engines, args.max_tokens)).serve_forever()
+    server = ThreadingHTTPServer((args.host, args.port), make_handler(engines, args.max_tokens))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    while True:
+        job = JOBS.get()
+        try:
+            job["result"] = job["run"]()
+        except Exception as e:  # e.g. client disconnected mid-stream
+            job["error"] = e
+        job["done"].set()
 
 
 if __name__ == "__main__":

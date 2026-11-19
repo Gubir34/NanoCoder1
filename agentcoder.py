@@ -1160,27 +1160,43 @@ def discover(timeout: float = 0.5) -> list:
     return [f for f in found if f]
 
 
-BENCH_MSGS = [{"role": "system", "content": "You are a careful coding agent. " + "Follow the project's conventions. " * 60},
-              {"role": "user", "content": "Write a Python function is_prime(n). Reply with code only."}]
+BENCH_FILE = "\n".join(f"{i:>5}\tdef handler_{i}(request, retries={i % 5}):\n      \treturn route(request, {i})"
+                       for i in range(1, 45))
 
 
 def bench(url: str, model: str) -> dict:
-    """Time one small agent-like request: score = time to first token + time for 64 tokens."""
+    """Time a realistic agent exchange, since that is what agentcoder sends all day.
+
+    A cold request with a ~1.2k-token system prompt, then the next turn: the same conversation plus a
+    ~700-token tool result. Servers that reuse the prompt prefix (KV cache) shine on the second one.
+    score = cold first-token / 4 + next-turn first-token + time for 64 tokens.
+    """
     llm = LLM(url, model)
     llm.max_tokens = 1
     llm.chat([{"role": "user", "content": "hi"}], None, lambda *_: None)  # load the model first
     llm.max_tokens = 48
-    t0, first, chars = time.time(), [0.0], [0]
+    system = (f"[run {random.random():.6f}] You are a careful coding agent. Follow the project's conventions, "
+              "read before you edit, keep diffs small and run the tests. " * 40)
+    msgs = [{"role": "system", "content": system},
+            {"role": "user", "content": "Find where retries are handled in handlers.py and summarize it."}]
 
-    def sink(mode, text):
-        first[0] = first[0] or time.time()
-        chars[0] += len(text)
-    llm.chat(BENCH_MSGS, None, sink)
-    end = time.time()
-    start = first[0] or end
-    toks = (llm.usage or {}).get("completion_tokens") or max(1, chars[0] // 4)
-    rate = toks / max(1e-3, end - start)
-    return {"score": (start - t0) + 64 / rate, "rate": rate, "ttft": start - t0, "at": time.time()}
+    def timed(messages):
+        t0, first, chars = time.time(), [0.0], [0]
+
+        def sink(mode, text):
+            first[0] = first[0] or time.time()
+            chars[0] += len(text)
+        content, _ = llm.chat(messages, None, sink)
+        end = time.time()
+        start = first[0] or end
+        toks = (llm.usage or {}).get("completion_tokens") or max(1, chars[0] // 4)
+        return start - t0, toks / max(1e-3, end - start), content
+
+    cold, _, reply = timed(msgs)
+    msgs += [{"role": "assistant", "content": reply or "Let me read the file."},
+             {"role": "user", "content": "Tool result (read_file handlers.py):\n" + BENCH_FILE + "\nNow summarize."}]
+    warm, rate, _ = timed(msgs)
+    return {"score": cold / 4 + warm + 64 / rate, "rate": rate, "ttft": warm, "cold": cold, "at": time.time()}
 
 
 def _load_cache() -> dict:
@@ -1212,7 +1228,7 @@ def pick_backend(model: str, backends: list, cache: dict, rebench: bool = False)
     for b, mid in cands:
         key = f"{b['url']}|{mid}"
         c = cache.get(key)
-        if rebench or not c or time.time() - c.get("at", 0) > 7 * 86400:
+        if rebench or not c or "cold" not in c or time.time() - c.get("at", 0) > 7 * 86400:
             w(dim(f"  ✻ benchmarking {model} on {b['name']}…\n"))
             try:
                 c = cache[key] = bench(b["url"], mid)
