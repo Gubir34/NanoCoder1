@@ -5,6 +5,9 @@
 
 Only assistant turns are trained. The prompt prefix (system + tools + task) runs without
 gradients and is reused as a KV cache, which roughly halves the cost per sample.
+
+Small Qwen models ship <tool_call>/</tool_call> with identical, untrained embedding rows (tied with
+the output layer), so LoRA alone can never make the model emit them. Those rows are trained too.
 """
 import argparse
 import json
@@ -38,6 +41,18 @@ def encode(tok, sample):
     return ids, mask, prefix
 
 
+@torch.no_grad()
+def decision_check(model, tok, data):
+    """Average loss hides a wrong *first* token (e.g. text instead of <tool_call>). Count exact hits."""
+    hits = 0
+    for ids, mask, prefix in data:
+        first = mask.index(True)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            logits = model(input_ids=torch.tensor([ids[:first]])).logits[0, -1]
+        hits += int(logits.argmax()) == ids[first]
+    return hits
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="Qwen/Qwen2.5-Coder-0.5B-Instruct")
@@ -45,6 +60,7 @@ def main():
     ap.add_argument("--out", default="finetune/adapters/agentcoder-worker-0.5b")
     ap.add_argument("--epochs", type=float, default=1.0)
     ap.add_argument("--lr", type=float, default=2e-4)
+    ap.add_argument("--token-lr", type=float, default=5e-3, help="lr for the trained special-token rows")
     ap.add_argument("--accum", type=int, default=4)
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--max-len", type=int, default=6144)
@@ -72,8 +88,10 @@ def main():
         return
 
     model = AutoModelForCausalLM.from_pretrained(args.base, torch_dtype=torch.bfloat16)
+    special = [i for i in tok.convert_tokens_to_ids(["<tool_call>", "</tool_call>"]) if isinstance(i, int)]
     cfg = LoraConfig(r=args.rank, lora_alpha=args.rank * 2, lora_dropout=0.05, task_type="CAUSAL_LM",
-                     target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+                     target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                     trainable_token_indices=special)
     model = get_peft_model(model, cfg)
     for p in model.parameters():
         if p.requires_grad:
@@ -82,7 +100,12 @@ def main():
     core, head = model.base_model.model.model, model.base_model.model.lm_head
 
     params = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.0)
+    token_params = [p for n, p in model.named_parameters() if p.requires_grad and "trainable_tokens" in n]
+    lora_params = [p for p in params if all(p is not q for q in token_params)]
+    # embedding rows start out identical to their neighbours; they need a much larger step to separate
+    opt = torch.optim.AdamW([{"params": lora_params, "lr": args.lr},
+                             {"params": token_params, "lr": args.token_lr}], weight_decay=0.0)
+    print(f"token rows: {sum(p.numel() for p in token_params)} params at lr {args.token_lr}")
     total = math.ceil(len(data) * args.epochs / args.accum)
     warm = max(1, total // 20)
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -124,6 +147,9 @@ def main():
                 print(f"step {step}/{total} · loss {sum(recent) / len(recent):.4f} · "
                       f"lr {sched.get_last_lr()[0]:.2e} · {el / (i + 1):.1f}s/sample · "
                       f"eta {el / (i + 1) * (len(order) - i - 1) / 60:.0f}m", flush=True)
+    model.eval()
+    hits = decision_check(model, tok, data[:40])
+    print(f"first-token check: {hits}/{min(40, len(data))} samples start their first reply with the right token")
     os.makedirs(args.out, exist_ok=True)
     model.save_pretrained(args.out)
     tok.save_pretrained(args.out)

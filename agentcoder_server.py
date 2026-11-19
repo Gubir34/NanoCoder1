@@ -74,7 +74,9 @@ class Engine:
         if self.cache is None or common == 0:
             self.cache, common = DynamicCache(), 0
         else:
-            self.cache.crop(common)
+            extra = self.cache.get_seq_length() - common
+            if extra > 0:
+                self.cache.crop(-extra)  # negative = drop that many tokens (works on old and new transformers)
         self.stats["reused_tokens"] += common
         logits = None
         for i in range(common, len(ids), 1024):  # chunked prefill keeps memory flat on long prompts
@@ -99,7 +101,7 @@ class Engine:
                 break
             out_ids.append(nxt)
             self.cached_ids.append(nxt)
-            text = self.tok.decode(out_ids, skip_special_tokens=True)
+            text = self.tok.decode(out_ids, skip_special_tokens=False)
             # stream text up to a tool call; hold back a possible partial "<tool_call>" tag
             cut = text.find(TAG)
             visible = text if cut < 0 else text[:cut]
@@ -112,7 +114,7 @@ class Engine:
                 on_text(visible[sent:])
                 sent = len(visible)
             logits = self._forward([nxt])
-        text = self.tok.decode(out_ids, skip_special_tokens=True)
+        text = self.tok.decode(out_ids, skip_special_tokens=False)
         return text, sent, len(ids), len(out_ids), reused
 
 
