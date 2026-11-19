@@ -40,6 +40,22 @@ MAX_STEPS = 40
 SUB_MAX_STEPS = 20
 DEFAULT_WORKERS = "small=qwen2.5-coder:0.5b,medium=qwen2.5-coder:1.5b,large=qwen2.5-coder:3b"
 READONLY_TIERS = {"small"}
+DEFAULT_REFINER = "qwen3.5:9b"
+REFINER_PROMPT = """You are the prompt refiner in a team of coding agents. You never write code and never talk to \
+the user. You turn the user's raw message into a clear brief for the orchestrator agent that will do the work.
+
+Write the brief in English with exactly these sections:
+GOAL: one or two sentences: what the user actually wants.
+DETAILS: bullet list of concrete requirements, file names and constraints. Mark your guesses with "(assumed)".
+DO NOT: bullet list of things the orchestrator must avoid for THIS request, e.g. scope creep, touching unrelated \
+files, deleting data, adding dependencies, changing public APIs, rewriting working code, asking needless questions.
+DONE WHEN: how to tell the task is finished (tests pass, command output, file exists...).
+REPLY LANGUAGE: the language the user wrote in.
+
+Rules:
+- Keep the user's intent. Clarify, never invent new requirements.
+- If the message is a short follow-up, confirmation or small talk ("yes", "continue", "thanks"), output exactly: PASS
+- Under 150 words. No preamble."""
 VERBS = ["Thinking", "Pondering", "Tinkering", "Cooking", "Noodling", "Scheming",
          "Crunching", "Brewing", "Untangling", "Hacking"]
 
@@ -531,7 +547,7 @@ class Stream:
 
 class Agent:
     def __init__(self, llm: LLM, cwd: str, yolo=False, text_tools=False, ctx_limit=32768,
-                 workers=None, role=None, parent=None):
+                 workers=None, role=None, parent=None, refiner=None):
         self.llm, self.cwd = llm, os.path.abspath(cwd)
         self.yolo, self.text_tools, self.ctx_limit = yolo, text_tools, ctx_limit
         self.role = role                      # None = orchestrator, else the worker tier name
@@ -539,6 +555,7 @@ class Agent:
         self.depth = parent.depth + 1 if parent else 0
         self.ind = "    " * self.depth
         self.workers = {} if role else dict(workers or {})   # tier -> LLM, orchestrator only
+        self.refiner = None if role else refiner              # LLM that rewrites user prompts
         self.show_think = False
         self.always: set = parent.root.always if parent else set()
         self.spinner = parent.spinner if parent else Spinner()
@@ -606,6 +623,12 @@ You are the orchestrator. With the `task` tool you can delegate subtasks to smal
 - Sub-agents do NOT see this conversation. Give each one complete, specific instructions and say what to report.
 - They are weaker than you. Keep hard reasoning and tricky edits for yourself; check their reports before relying on them.
 - Delegate when it saves work (broad searches, reading many files, routine edits). For one small file, just do it yourself."""
+        if self.refiner:
+            p += """
+
+# Briefs
+User messages may end with a <brief> written by a refiner model that clarified the request. Follow its \
+DO NOT rules and DONE WHEN criteria. If the brief conflicts with the user's own words, the user wins."""
         if self.role:
             p += f"""
 
@@ -644,13 +667,17 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
 
     # ── main loop ──
     def turn(self, text: str) -> None:
+        raw = text
         text = self.expand_mentions(text)
         if self.pending_ctx:
             text, self.pending_ctx = self.pending_ctx + "\n\n" + text, ""
-        if self.est_tokens() > self.ctx_limit * 0.8:
-            self.compact()
-        self.messages.append({"role": "user", "content": text})
         try:
+            if self.est_tokens() > self.ctx_limit * 0.8:
+                self.compact()
+            brief = self.refine(raw)
+            if brief:
+                text += f"\n\n<brief>\n{brief}\n</brief>"
+            self.messages.append({"role": "user", "content": text})
             if not self.run_loop(MAX_STEPS):
                 w(yellow(f"  (stopped after {MAX_STEPS} steps — say 'continue' to keep going)\n"))
         except KeyboardInterrupt:
@@ -663,6 +690,43 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
             self.repair_history()
             ensure_nl()
             w(red(f"  ✗ {e}\n"))
+
+    def refine(self, raw: str) -> str:
+        """Ask the refiner model to turn a raw user message into a brief. '' = no brief."""
+        if not self.refiner or len(raw.strip()) < 12:
+            return ""
+        recent = []
+        for m in self.messages[1:]:
+            if m["role"] == "user" and not m["content"].startswith("<tool_result"):
+                recent.append("USER: " + m["content"].split("\n\n<brief>")[0][:600])
+            elif m["role"] == "assistant" and m.get("content"):
+                recent.append("AGENT: " + TOOL_CALL_RE.sub("", m["content"])[:600])
+        entries = ", ".join(sorted(e for e in os.listdir(self.cwd) if e not in IGNORED_DIRS)[:40])
+        ctx = f"Project: {self.cwd}\nTop-level entries: {entries or '(empty)'}\n"
+        if recent:
+            ctx += "Recent conversation:\n" + "\n".join(recent[-6:]) + "\n"
+        req = [{"role": "system", "content": REFINER_PROMPT},
+               {"role": "user", "content": f"{ctx}\nUser's new message:\n{raw}"}]
+        self.spinner.start("Refining prompt")
+        try:
+            out, _ = self.refiner.chat(req, None, lambda *_: None)
+        except LLMError as e:
+            self.spinner.stop()
+            w(yellow(f"  ! refiner failed, continuing without brief: {clip(str(e), 100)}\n"))
+            return ""
+        finally:
+            self.spinner.stop()
+        brief = THINK_RE.sub("", out).strip()
+        if not brief or brief.upper().startswith("PASS"):
+            return ""
+        ensure_nl()
+        w(f"{cyan('●')} {bold('Brief')}{dim('(' + self.refiner.model + ')')}\n")
+        lines = brief.splitlines()
+        for i, line in enumerate(lines[:24]):
+            w(("  ⎿  " if i == 0 else "     ") + dim(clip(line, term_width() - 8)) + "\n")
+        if len(lines) > 24:
+            w("     " + dim(f"… +{len(lines) - 24} lines") + "\n")
+        return brief
 
     def run_loop(self, max_steps: int) -> bool:
         """Run model/tool steps until the model stops calling tools. False if max_steps was hit."""
@@ -1060,11 +1124,12 @@ HELP = """\
   /think         toggle showing the model's reasoning
   /tokens        show context usage
   /team          show the sub-agent team
+  /refine        toggle the prompt refiner
   /exit          quit (or ctrl+d)
   !<command>     run a shell command; its output goes into context
   @path          attach a file to your message
   line ending with \\  continue on the next line"""
-COMMANDS = ["/help", "/clear", "/compact", "/init", "/model", "/models", "/yolo", "/think", "/tokens", "/team", "/exit"]
+COMMANDS = ["/help", "/clear", "/compact", "/init", "/model", "/models", "/yolo", "/think", "/tokens", "/team", "/refine", "/exit"]
 INIT_PROMPT = ("Explore this project (structure, languages, build/test commands, conventions) and write a "
                "concise NANOCODER.md at the project root that will help a coding agent work here. "
                "If it already exists, improve it.")
@@ -1082,6 +1147,8 @@ def banner(agent: Agent) -> None:
     rows = [f"{orange('✻')} {bold('nanocoder')} {dim('v' + VERSION)}", "",
             f"  {dim('model')}  {agent.llm.model}", f"  {dim('server')} {agent.llm.base_url}",
             f"  {dim('cwd')}    {agent.cwd}"]
+    if agent.refiner:
+        rows.append(f"  {dim('brief')}  {agent.refiner.model}")
     if agent.workers:
         rows.append(f"  {dim('team')}   " + " · ".join(f"{t} {llm.model}" for t, llm in agent.workers.items()))
     rows += ["",
@@ -1108,6 +1175,10 @@ def check_server(agent: Agent) -> None:
     if missing(agent.llm):
         w(yellow(f"  ! model '{agent.llm.model}' not found on the server.")
           + dim(f" Available: {', '.join(names[:8]) or '-'}\n"))
+    if agent.refiner and agent.refiner.base_url == agent.llm.base_url and missing(agent.refiner):
+        w(dim(f"  ! prompt refiner disabled (model not pulled): {agent.refiner.model}\n"))
+        agent.refiner = None
+        agent.messages[0]["content"] = agent.system_prompt()
     gone = [t for t, llm in agent.workers.items() if llm.base_url == agent.llm.base_url and missing(llm)]
     if gone:
         w(dim("  ! sub-agents disabled (model not pulled): "
@@ -1185,7 +1256,16 @@ def command(agent: Agent, line: str) -> bool:
     elif cmd == "/think":
         agent.show_think = not agent.show_think
         w(dim(f"✻ Showing reasoning: {'on' if agent.show_think else 'off'}\n"))
+    elif cmd == "/refine":
+        if agent.refiner:
+            agent.parked_refiner, agent.refiner = agent.refiner, None
+        else:
+            agent.refiner = getattr(agent, "parked_refiner", None)
+        agent.messages[0]["content"] = agent.system_prompt()
+        w(dim(f"✻ Prompt refiner: {agent.refiner.model if agent.refiner else 'off'}\n"))
     elif cmd == "/team":
+        if agent.refiner:
+            w(f"  {bold('refiner'):<13}  {agent.refiner.model}\n")
         w(f"  {bold('orchestrator')}  {agent.llm.model}\n")
         for t, llm in agent.workers.items():
             w(f"  {t:<13} {llm.model}{dim(' (read-only)') if t in READONLY_TIERS else ''}\n")
@@ -1248,14 +1328,22 @@ def main(argv=None) -> int:
                     help="sub-agent model, repeatable, e.g. -w small=qwen2.5-coder:0.5b "
                          f"(default: {DEFAULT_WORKERS}; tier 'small' is read-only)")
     ap.add_argument("--no-workers", action="store_true", help="single agent, no sub-agents")
+    ap.add_argument("-r", "--refiner", default=env("NANOCODER_REFINER", DEFAULT_REFINER), metavar="MODEL",
+                    help="model that rewrites your prompt into a brief for the orchestrator "
+                         "(MODEL or MODEL@BASE_URL)")
+    ap.add_argument("--no-refiner", action="store_true", help="send prompts to the orchestrator as-is")
     ap.add_argument("-C", "--cwd", default=os.getcwd(), help="project directory")
     ap.add_argument("--version", action="version", version=f"nanocoder {VERSION}")
     args = ap.parse_args(argv)
 
     specs = [] if args.no_workers else (args.worker or [env("NANOCODER_WORKERS", DEFAULT_WORKERS)])
     workers = parse_workers(specs, args.base_url, args.api_key)
+    refiner = None
+    if not args.no_refiner and args.refiner:
+        model, _, url = args.refiner.partition("@")
+        refiner = LLM(url or args.base_url, model, args.api_key, temperature=0.1)
     agent = Agent(LLM(args.base_url, args.model, args.api_key), args.cwd, yolo=args.yolo,
-                  text_tools=args.text_tools, ctx_limit=args.ctx, workers=workers)
+                  text_tools=args.text_tools, ctx_limit=args.ctx, workers=workers, refiner=refiner)
 
     prompt = " ".join(args.prompt)
     if not prompt and not sys.stdin.isatty():
