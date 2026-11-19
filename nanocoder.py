@@ -37,6 +37,9 @@ IGNORED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "env", "
 PROJECT_NOTES = ("NANOCODER.md", "AGENTS.md", "CLAUDE.md")
 MAX_TOOL_OUTPUT = 20_000
 MAX_STEPS = 40
+SUB_MAX_STEPS = 20
+DEFAULT_WORKERS = "small=qwen2.5-coder:0.5b,medium=qwen2.5-coder:1.5b,large=qwen2.5-coder:3b"
+READONLY_TIERS = {"small"}
 VERBS = ["Thinking", "Pondering", "Tinkering", "Cooking", "Noodling", "Scheming",
          "Crunching", "Brewing", "Untangling", "Hacking"]
 
@@ -430,7 +433,8 @@ TOOLS = [
            "ignore_case": _b("Case-insensitive search.")}, ["pattern"]),
 ]
 DISPLAY = {"read_file": "Read", "write_file": "Write", "edit_file": "Edit",
-           "bash": "Bash", "glob": "Glob", "grep": "Grep"}
+           "bash": "Bash", "glob": "Glob", "grep": "Grep", "task": "Task"}
+READ_ONLY_TOOLS = {"read_file", "glob", "grep"}
 
 
 class ToolError(Exception):
@@ -476,6 +480,12 @@ class Stream:
         a = self.a
         if not text or mode == "hide":
             return
+        if a.role:  # sub-agent: no streaming text, just spinner updates
+            if mode == "tool":
+                a.spinner.label = f"{a.role} agent · preparing {DISPLAY.get(text, text)}"
+            elif mode == "think":
+                a.spinner.label = f"{a.role} agent · thinking"
+            return
         if mode == "tool":
             self._close_think()
             self.md.flush()
@@ -520,18 +530,41 @@ class Stream:
 
 
 class Agent:
-    def __init__(self, llm: LLM, cwd: str, yolo=False, text_tools=False, ctx_limit=32768):
+    def __init__(self, llm: LLM, cwd: str, yolo=False, text_tools=False, ctx_limit=32768,
+                 workers=None, role=None, parent=None):
         self.llm, self.cwd = llm, os.path.abspath(cwd)
         self.yolo, self.text_tools, self.ctx_limit = yolo, text_tools, ctx_limit
+        self.role = role                      # None = orchestrator, else the worker tier name
+        self.root = parent.root if parent else self
+        self.depth = parent.depth + 1 if parent else 0
+        self.ind = "    " * self.depth
+        self.workers = {} if role else dict(workers or {})   # tier -> LLM, orchestrator only
         self.show_think = False
-        self.always: set = set()
-        self.spinner = Spinner()
+        self.always: set = parent.root.always if parent else set()
+        self.spinner = parent.spinner if parent else Spinner()
         self.pending_ctx = ""
         self.stop_turn = False
         self.tools = {"read_file": self.t_read_file, "write_file": self.t_write_file,
                       "edit_file": self.t_edit_file, "bash": self.t_bash,
                       "glob": self.t_glob, "grep": self.t_grep}
+        if role in READONLY_TIERS:
+            self.tools = {k: v for k, v in self.tools.items() if k in READ_ONLY_TOOLS}
+        if self.workers:
+            self.tools["task"] = self.t_task
         self.reset()
+
+    def schemas(self) -> list:
+        out = [t for t in TOOLS if t["function"]["name"] in self.tools]
+        if "task" in self.tools:
+            team = "; ".join(f"{t} = {llm.model}{' (read-only)' if t in READONLY_TIERS else ''}"
+                             for t, llm in self.workers.items())
+            out.append(_tool(
+                "task", "Delegate a self-contained subtask to a smaller, faster sub-agent model. It cannot "
+                "see this conversation: give complete, specific instructions (file paths, goal, what to "
+                f"report). Returns the sub-agent's final report. Team: {team}.",
+                {"agent": {"type": "string", "enum": list(self.workers), "description": "Which sub-agent."},
+                 "task": _s("Full instructions for the sub-agent.")}, ["agent", "task"]))
+        return out
 
     # ── context ──
     def reset(self) -> None:
@@ -560,13 +593,33 @@ You solve software engineering tasks by reading, searching and editing files and
 - Keep going until the task is actually done. Don't ask permission for routine steps; ask only when the request is truly ambiguous.
 - Be concise and direct. Reply in the user's language. Use Markdown. No filler, no long recaps.
 - Never run destructive commands (rm -rf, git reset --hard, force push...) unless the user explicitly asked."""
+        if self.workers:
+            team = "\n".join(f"- {t} ({llm.model}): " + (
+                "read-only. Codebase searches, finding definitions/usages, reading and summarizing files."
+                if t in READONLY_TIERS else "can read, edit and run commands. Simple well-specified edits, "
+                "writing tests, running tests and reporting results.") for t, llm in self.workers.items())
+            p += f"""
+
+# Your team
+You are the orchestrator. With the `task` tool you can delegate subtasks to smaller, faster models:
+{team}
+- Sub-agents do NOT see this conversation. Give each one complete, specific instructions and say what to report.
+- They are weaker than you. Keep hard reasoning and tricky edits for yourself; check their reports before relying on them.
+- Delegate when it saves work (broad searches, reading many files, routine edits). For one small file, just do it yourself."""
+        if self.role:
+            p += f"""
+
+# Your role
+You are a sub-agent ("{self.role}") working for an orchestrator model. It cannot see your tool calls or their output, \
+only your final reply. Do the task with your tools, then reply with a concise report: what you found or changed, \
+with file paths and line numbers.{" You are read-only: you cannot edit files or run commands." if self.role in READONLY_TIERS else ""}"""
         if self.text_tools:
             p += "\n\n# Tools\nCall a tool by writing exactly:\n<tool_call>\n" \
                  '{"name": "tool_name", "arguments": {"arg": "value"}}\n</tool_call>\n' \
                  "You may emit several tool calls in one reply. Then stop and wait: results come back " \
                  "as <tool_result> messages. When the task is done, reply normally without tool calls.\n" \
                  "Available tools:\n"
-            for t in TOOLS:
+            for t in self.schemas():
                 f = t["function"]
                 params = ", ".join(f"{k}: {v['type']}{'' if k in f['parameters']['required'] else '?'}"
                                    for k, v in f["parameters"]["properties"].items())
@@ -597,12 +650,8 @@ You solve software engineering tasks by reading, searching and editing files and
         if self.est_tokens() > self.ctx_limit * 0.8:
             self.compact()
         self.messages.append({"role": "user", "content": text})
-        self.stop_turn = False
         try:
-            for _ in range(MAX_STEPS):
-                if not self.step() or self.stop_turn:
-                    break
-            else:
+            if not self.run_loop(MAX_STEPS):
                 w(yellow(f"  (stopped after {MAX_STEPS} steps — say 'continue' to keep going)\n"))
         except KeyboardInterrupt:
             self.spinner.stop()
@@ -615,12 +664,21 @@ You solve software engineering tasks by reading, searching and editing files and
             ensure_nl()
             w(red(f"  ✗ {e}\n"))
 
+    def run_loop(self, max_steps: int) -> bool:
+        """Run model/tool steps until the model stops calling tools. False if max_steps was hit."""
+        self.stop_turn = False
+        for _ in range(max_steps):
+            if not self.step() or self.stop_turn:
+                return True
+        return False
+
     def step(self) -> bool:
         """One model call + tool execution. Returns True if tools were called."""
         stream = Stream(self)
-        self.spinner.start(random.choice(VERBS))
+        verb = random.choice(VERBS)
+        self.spinner.start(f"{self.role} agent · {verb.lower()}" if self.role else verb)
         try:
-            content, calls = self.llm.chat(self.messages, None if self.text_tools else TOOLS, stream)
+            content, calls = self.llm.chat(self.messages, None if self.text_tools else self.schemas(), stream)
         except LLMError as e:
             if not self.text_tools and e.code in (400, 422, 500) and "tool" in e.body.lower():
                 self.spinner.stop()
@@ -684,28 +742,28 @@ You solve software engineering tasks by reading, searching and editing files and
                 raise ValueError("arguments must be a JSON object")
         except ValueError as e:
             ensure_nl()
-            w(f"{red('●')} {bold(name or '?')}\n  ⎿  {red('invalid tool arguments')}\n")
+            w(f"{self.ind}{red('●')} {bold(name or '?')}\n  ⎿  {red('invalid tool arguments')}\n")
             return f"Error: could not parse tool arguments as a JSON object ({e}). Retry with valid JSON."
         ensure_nl()
-        w(f"{green('●')} {bold(DISPLAY.get(name, name))}{dim('(' + self.arg_summary(name, args) + ')')}\n")
+        w(f"{self.ind}{green('●')} {bold(DISPLAY.get(name, name))}{dim('(' + self.arg_summary(name, args) + ')')}\n")
         fn = self.tools.get(name)
         if not fn:
-            w(f"  ⎿  {red('unknown tool')}\n")
+            w(f"{self.ind}  ⎿  {red('unknown tool')}\n")
             return f"Error: unknown tool '{name}'. Available: {', '.join(self.tools)}."
         try:
             out = fn(**args)
         except ToolDenied as e:
             said = str(e).partition("and said: ")[2]
-            w(f"  ⎿  {yellow('Denied' + (': ' + clip(said, term_width() - 20) if said else ''))}\n")
+            w(f"{self.ind}  ⎿  {yellow('Denied' + (': ' + clip(said, term_width() - 20) if said else ''))}\n")
             return str(e)
         except ToolError as e:
-            w(f"  ⎿  {red(clip(str(e).splitlines()[0], term_width() - 8))}\n")
+            w(f"{self.ind}  ⎿  {red(clip(str(e).splitlines()[0], term_width() - 8))}\n")
             return f"Error: {e}"
         except TypeError as e:
-            w(f"  ⎿  {red('bad arguments: ' + str(e))}\n")
+            w(f"{self.ind}  ⎿  {red('bad arguments: ' + str(e))}\n")
             return f"Error: bad arguments for {name}: {e}"
         except (OSError, re.error) as e:
-            w(f"  ⎿  {red(str(e))}\n")
+            w(f"{self.ind}  ⎿  {red(str(e))}\n")
             return f"Error: {e}"
         model_out, shown = out if isinstance(out, tuple) else (out, None)
         self.show_result(shown if shown is not None else model_out)
@@ -713,37 +771,40 @@ You solve software engineering tasks by reading, searching and editing files and
 
     @staticmethod
     def arg_summary(name: str, a: dict) -> str:
-        key = {"bash": "command", "glob": "pattern", "grep": "pattern"}.get(name, "path")
+        key = {"bash": "command", "glob": "pattern", "grep": "pattern", "task": "task"}.get(name, "path")
         s = str(a.get(key, ""))
+        if name == "task":
+            s = f"{a.get('agent', '?')}: {s}"
         if name == "grep" and a.get("path"):
             s += f" in {a['path']}"
         return clip(s.replace("\n", " ⏎ "), term_width() - 20)
 
-    @staticmethod
-    def show_result(text: str, max_lines: int = 4) -> None:
+    def show_result(self, text: str, max_lines: int = 4) -> None:
         lines = text.rstrip("\n").splitlines() or ["(no output)"]
         width = term_width() - 8
         for i, line in enumerate(lines[:max_lines]):
-            w(("  ⎿  " if i == 0 else "     ") + dim(clip(line, width)) + "\n")
+            w(self.ind + ("  ⎿  " if i == 0 else "     ") + dim(clip(line, width)) + "\n")
         if len(lines) > max_lines:
-            w("     " + dim(f"… +{len(lines) - max_lines} lines") + "\n")
+            w(self.ind + "     " + dim(f"… +{len(lines) - max_lines} lines") + "\n")
 
     # ── permissions ──
     def ask(self, kind: str, title: str, preview: list) -> None:
-        bar = orange("  │ ")
-        if self.yolo or kind in self.always:
+        bar = self.ind + orange("  │ ")
+        if self.root.yolo or kind in self.always:
             for line in preview[:20]:
                 w(bar + line + "\n")
             return
         if not sys.stdin.isatty():
             raise ToolDenied("Permission denied: not interactive (run nanocoder with --yolo to auto-approve).")
-        w(orange("  ╭─ ") + bold(title) + "\n")
+        if self.role:
+            title = f"[{self.role} agent] {title}"
+        w(self.ind + orange("  ╭─ ") + bold(title) + "\n")
         for line in preview:
             w(bar + line + "\n")
-        w(orange("  ╰─ ") + "Allow? " + bold("[y]") + "es · " + bold("[a]") + f"lways for {kind} · "
+        w(self.ind + orange("  ╰─ ") + "Allow? " + bold("[y]") + "es · " + bold("[a]") + f"lways for {kind} · "
           + bold("[n]") + "o · or type what to do instead\n")
         try:
-            ans = input(prompt_str("  ❯ ")).strip()
+            ans = input(prompt_str(self.ind + "  ❯ ")).strip()
         except (KeyboardInterrupt, EOFError):
             w("\n")
             raise KeyboardInterrupt from None
@@ -754,7 +815,7 @@ You solve software engineering tasks by reading, searching and editing files and
             self.always.add(kind)
             return
         if a in ("n", "no", "h", "hayir", "hayır"):
-            self.stop_turn = True
+            self.stop_turn = self.root.stop_turn = True
             raise ToolDenied("The user denied this action. Stop and wait for their instructions.")
         raise ToolDenied(f"The user denied this action and said: {ans}")
 
@@ -851,6 +912,27 @@ You solve software engineering tasks by reading, searching and editing files and
             return " Read the file again and copy the exact text."
         snippet = "\n".join(tl[best_i:best_i + n])
         return f" Closest match (lines {best_i + 1}-{best_i + n}, {best:.0%} similar):\n{snippet}"
+
+    def t_task(self, agent, task):
+        llm = self.workers.get(agent)
+        if not llm:
+            raise ToolError(f"No sub-agent '{agent}'. Available: {', '.join(self.workers) or 'none'}.")
+        sub = Agent(llm, self.cwd, ctx_limit=self.ctx_limit, role=agent, parent=self)
+        sub.messages.append({"role": "user", "content": task})
+        t0 = time.time()
+        try:
+            finished = sub.run_loop(SUB_MAX_STEPS)
+        except LLMError as e:
+            raise ToolError(f"{agent} agent failed: {e}") from None
+        report = next((m.get("content") or "" for m in reversed(sub.messages) if m["role"] == "assistant"), "")
+        report = TOOL_CALL_RE.sub("", report).strip() or "(the sub-agent returned no report)"
+        n_calls = sum(len(m.get("tool_calls") or []) for m in sub.messages) or \
+            sum(len(parse_text_calls(m.get("content") or "")) for m in sub.messages if m["role"] == "assistant")
+        if not finished:
+            report += f"\n\n[sub-agent hit its {SUB_MAX_STEPS}-step limit; the work may be incomplete]"
+        if sub.stop_turn:
+            report += "\n\n[the user stopped this sub-agent]"
+        return report, f"{agent} agent ({llm.model}) done · {n_calls} tool call{"s" if n_calls != 1 else ""} · {int(time.time() - t0)}s"
 
     def t_bash(self, command, timeout=120):
         self.ask("Bash", "Run command", [cyan(clip(line, term_width() - 8)) for line in command.splitlines()])
@@ -977,11 +1059,12 @@ HELP = """\
   /yolo          toggle auto-approve for edits and commands
   /think         toggle showing the model's reasoning
   /tokens        show context usage
+  /team          show the sub-agent team
   /exit          quit (or ctrl+d)
   !<command>     run a shell command; its output goes into context
   @path          attach a file to your message
   line ending with \\  continue on the next line"""
-COMMANDS = ["/help", "/clear", "/compact", "/init", "/model", "/models", "/yolo", "/think", "/tokens", "/exit"]
+COMMANDS = ["/help", "/clear", "/compact", "/init", "/model", "/models", "/yolo", "/think", "/tokens", "/team", "/exit"]
 INIT_PROMPT = ("Explore this project (structure, languages, build/test commands, conventions) and write a "
                "concise NANOCODER.md at the project root that will help a coding agent work here. "
                "If it already exists, improve it.")
@@ -998,7 +1081,10 @@ def prompt_str(s: str) -> str:
 def banner(agent: Agent) -> None:
     rows = [f"{orange('✻')} {bold('nanocoder')} {dim('v' + VERSION)}", "",
             f"  {dim('model')}  {agent.llm.model}", f"  {dim('server')} {agent.llm.base_url}",
-            f"  {dim('cwd')}    {agent.cwd}", "",
+            f"  {dim('cwd')}    {agent.cwd}"]
+    if agent.workers:
+        rows.append(f"  {dim('team')}   " + " · ".join(f"{t} {llm.model}" for t, llm in agent.workers.items()))
+    rows += ["",
             dim("  /help for commands · @file to attach · !cmd for shell")]
     inner = min(term_width() - 4, max(vlen(r) for r in rows) + 2)
     w(orange("╭" + "─" * (inner + 2) + "╮") + "\n")
@@ -1016,9 +1102,38 @@ def check_server(agent: Agent) -> None:
         w(yellow(f"  ! {e}\n") + dim("    Is your model server running? For Ollama: `ollama serve` then "
                                      f"`ollama pull {agent.llm.model}`\n"))
         return
-    m = agent.llm.model
-    if names and m not in names and f"{m}:latest" not in names:
-        w(yellow(f"  ! model '{m}' not found on the server.") + dim(f" Available: {', '.join(names[:8]) or '-'}\n"))
+    def missing(llm: LLM) -> bool:
+        return bool(names) and llm.model not in names and f"{llm.model}:latest" not in names
+
+    if missing(agent.llm):
+        w(yellow(f"  ! model '{agent.llm.model}' not found on the server.")
+          + dim(f" Available: {', '.join(names[:8]) or '-'}\n"))
+    gone = [t for t, llm in agent.workers.items() if llm.base_url == agent.llm.base_url and missing(llm)]
+    if gone:
+        w(dim("  ! sub-agents disabled (model not pulled): "
+              + ", ".join(f"{t}={agent.workers[t].model}" for t in gone) + "\n"))
+        set_workers(agent, {t: llm for t, llm in agent.workers.items() if t not in gone})
+
+
+def set_workers(agent: Agent, workers: dict) -> None:
+    agent.workers = workers
+    agent.tools.pop("task", None)
+    if workers:
+        agent.tools["task"] = agent.t_task
+    agent.messages[0]["content"] = agent.system_prompt()
+
+
+def parse_workers(specs: list, base_url: str, api_key: str) -> dict:
+    """'small=qwen2.5-coder:0.5b' or 'big=some-model@http://host:1234/v1' -> {tier: LLM}."""
+    out = {}
+    for spec in specs:
+        for item in filter(None, (x.strip() for x in spec.split(","))):
+            tier, eq, model = item.partition("=")
+            if not eq or not tier.strip() or not model.strip():
+                raise SystemExit(f"nanocoder: bad worker spec '{item}', expected TIER=MODEL[@BASE_URL]")
+            model, _, url = model.strip().partition("@")
+            out[tier.strip()] = LLM(url or base_url, model, api_key)
+    return out
 
 
 def read_input(agent: Agent) -> str:
@@ -1070,6 +1185,12 @@ def command(agent: Agent, line: str) -> bool:
     elif cmd == "/think":
         agent.show_think = not agent.show_think
         w(dim(f"✻ Showing reasoning: {'on' if agent.show_think else 'off'}\n"))
+    elif cmd == "/team":
+        w(f"  {bold('orchestrator')}  {agent.llm.model}\n")
+        for t, llm in agent.workers.items():
+            w(f"  {t:<13} {llm.model}{dim(' (read-only)') if t in READONLY_TIERS else ''}\n")
+        if not agent.workers:
+            w(dim("  no sub-agents (configure with --worker TIER=MODEL)\n"))
     elif cmd == "/tokens":
         u = agent.llm.usage or {}
         w(f"  ~{agent.est_tokens()} tokens in context (limit {agent.ctx_limit}), "
@@ -1123,17 +1244,24 @@ def main(argv=None) -> int:
                     help="describe tools in the prompt (for models without native tool calling)")
     ap.add_argument("--ctx", type=int, default=int(env("NANOCODER_CTX", "32768")),
                     help="context window size in tokens, used for auto-compaction")
+    ap.add_argument("-w", "--worker", action="append", metavar="TIER=MODEL",
+                    help="sub-agent model, repeatable, e.g. -w small=qwen2.5-coder:0.5b "
+                         f"(default: {DEFAULT_WORKERS}; tier 'small' is read-only)")
+    ap.add_argument("--no-workers", action="store_true", help="single agent, no sub-agents")
     ap.add_argument("-C", "--cwd", default=os.getcwd(), help="project directory")
     ap.add_argument("--version", action="version", version=f"nanocoder {VERSION}")
     args = ap.parse_args(argv)
 
-    agent = Agent(LLM(args.base_url, args.model, args.api_key), args.cwd,
-                  yolo=args.yolo, text_tools=args.text_tools, ctx_limit=args.ctx)
+    specs = [] if args.no_workers else (args.worker or [env("NANOCODER_WORKERS", DEFAULT_WORKERS)])
+    workers = parse_workers(specs, args.base_url, args.api_key)
+    agent = Agent(LLM(args.base_url, args.model, args.api_key), args.cwd, yolo=args.yolo,
+                  text_tools=args.text_tools, ctx_limit=args.ctx, workers=workers)
 
     prompt = " ".join(args.prompt)
     if not prompt and not sys.stdin.isatty():
         prompt = sys.stdin.read().strip()
     if prompt:
+        check_server(agent)
         agent.turn(prompt)
         return 0
 

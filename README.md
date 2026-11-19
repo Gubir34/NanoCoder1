@@ -31,6 +31,7 @@ Dosya okur, arar, düzenler, komut çalıştırır. Bunları yapmadan önce sana
 - **Otomatik compaction**: context dolunca konuşmayı özetler
 - `@dosya` ile dosya ekleme, `!komut` ile shell, proje notları için `NANOCODER.md` (`AGENTS.md`/`CLAUDE.md` da okunur)
 - Ctrl+C her zaman güvenli, konuşma geçmişi bozulmaz
+- **Ajan ekibi**: büyük bir "şef" model planlar, küçük modellere iş dağıtır (aşağıda)
 
 ## Kurulum
 
@@ -78,6 +79,33 @@ nanocoder --base-url http://localhost:1234/v1   # LM Studio
 | `/tokens` | context kullanımını gösterir |
 | `!ls -la` | shell komutu çalıştırır, çıktısı bir sonraki mesajla modele gider |
 | `@src/main.py` | dosyayı mesaja ekler |
+
+## Ajan ekibi (orkestratör + sub-agent'lar)
+
+Ana model **şef** olarak çalışır ve `task` tool'u ile küçük modellere iş paslar. Küçük modeller kendi
+tool döngülerini çalıştırıp şefe kısa bir rapor döner. Şef onların tool çıktılarını görmez, sadece raporu görür.
+Böylece şefin context'i şişmez.
+
+| Rol | Varsayılan model | Yetki |
+|---|---|---|
+| şef (`-m`) | `qwen2.5-coder:7b` | her şey + iş dağıtma |
+| `small` | `qwen2.5-coder:0.5b` | **sadece okuma** (arama, okuma, özetleme) |
+| `medium` | `qwen2.5-coder:1.5b` | okuma + düzenleme + komut |
+| `large` | `qwen2.5-coder:3b` | okuma + düzenleme + komut |
+
+```bash
+ollama pull qwen2.5-coder:7b qwen2.5-coder:0.5b qwen2.5-coder:1.5b qwen2.5-coder:3b
+OLLAMA_MAX_LOADED_MODELS=4 OLLAMA_CONTEXT_LENGTH=32768 ollama serve
+
+nanocoder -w small=qwen3:0.6b -w medium=qwen3:1.7b          # kendi ekibini kur
+nanocoder -w big=llama3:8b@http://localhost:1234/v1          # başka sunucudaki model
+nanocoder --no-workers                                       # tek ajan
+```
+
+- Sunucuda olmayan işçi modelleri başlangıçta otomatik devre dışı kalır
+- Alt ajanların düzenleme ve komutları da aynı onay ekranından geçer. `n` dersen hem işçi hem şef durur
+- Alt ajanlar başka ajan çağıramaz, yani sonsuz delegasyon zinciri yok
+- `/team` ekibi gösterir. Ortam değişkeni: `NANOCODER_WORKERS="small=...,medium=..."`
 
 ## Model önerileri
 
