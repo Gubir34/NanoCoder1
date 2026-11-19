@@ -33,7 +33,7 @@ VERSION = "0.1.0"
 DEFAULT_MODEL = "qwen2.5-coder:7b"
 DEFAULT_BASE_URL = "http://localhost:11434/v1"
 # local servers probed by --base-url auto (name, url); override with AGENTCODER_BACKENDS="name=url,..."
-KNOWN_BACKENDS = [("ollama", "http://127.0.0.1:11434/v1"), ("llama.cpp", "http://127.0.0.1:8080/v1"),
+KNOWN_BACKENDS = [("agentcoder", "http://127.0.0.1:8090/v1"), ("ollama", "http://127.0.0.1:11434/v1"), ("llama.cpp", "http://127.0.0.1:8080/v1"),
                   ("llama.cpp", "http://127.0.0.1:8081/v1"), ("llama.cpp", "http://127.0.0.1:8082/v1"),
                   ("llama.cpp", "http://127.0.0.1:8083/v1"), ("vllm", "http://127.0.0.1:8000/v1"),
                   ("sglang", "http://127.0.0.1:30000/v1"), ("lmstudio", "http://127.0.0.1:1234/v1")]
@@ -1148,7 +1148,8 @@ def discover(timeout: float = 0.5) -> list:
         except (LLMError, ValueError, OSError):
             return
         owner = next((m.get("owned_by") for m in data if m.get("owned_by")), "")
-        name = {"llamacpp": "llama.cpp", "vllm": "vllm", "sglang": "sglang"}.get(owner, name)
+        name = {"llamacpp": "llama.cpp", "vllm": "vllm", "sglang": "sglang",
+                "agentcoder": "agentcoder-server"}.get(owner, name)
         found[i] = {"name": name, "url": url, "models": [m.get("id", "") for m in data if m.get("id")]}
 
     threads = [threading.Thread(target=probe, args=(i, n, u), daemon=True) for i, (n, u) in enumerate(specs)]
