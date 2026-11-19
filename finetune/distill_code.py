@@ -39,13 +39,20 @@ def main():
     ap.add_argument("--tries", type=int, default=2, help="greedy first, then sampled retries")
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--out", default=os.path.join(HERE, "data", "code_distill.jsonl"))
+    ap.add_argument("--resume", action="store_true", help="append, continuing after the last kept problem")
     args = ap.parse_args()
     rng = random.Random(args.seed)
     probs = [p for p in map(usable, load(args.mbpp, TRAIN_SPLITS)) if p]
-    kept = 0
-    with open(args.out, "w") as fh:
-        for i, p in enumerate(probs, 1):
-            prompt = chat_prompt(p, rng)
+    prompts = [chat_prompt(p, rng) for p in probs]  # drawn up front so --resume sees the same prompts
+    done, kept = 0, 0
+    if args.resume and os.path.exists(args.out):
+        seen = {json.loads(line)["messages"][1]["content"] for line in open(args.out)}
+        kept = len(seen)
+        done = max((i for i, q in enumerate(prompts, 1) if q in seen), default=0)
+    with open(args.out, "a" if args.resume else "w") as fh:
+        for i, (p, prompt) in enumerate(zip(probs, prompts), 1):
+            if i <= done:
+                continue
             for t in range(args.tries):
                 reply = ask(args.url, args.model, prompt, 0.0 if t == 0 else 0.7)
                 if "```" in reply and passes(extract(reply), p["tests"]):
