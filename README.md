@@ -188,8 +188,9 @@ Agent'lar her turda tüm konuşmayı baştan yollar. Genel amaçlı sunucular bu
 pip install "agentcoder[server] @ git+https://github.com/gubir34/NanoCoder1"   # torch, transformers, peft
 agentcoder-server \
     --model qwen2.5-coder:7b=Qwen/Qwen2.5-Coder-7B-Instruct \
-    --model agentcoder-worker:0.5b=Qwen/Qwen2.5-Coder-0.5B-Instruct+finetune/adapters/agentcoder-worker-0.5b
-agentcoder -w small=agentcoder-worker:0.5b      # 8090'da otomatik bulunur
+    --model agentcoder-worker:0.5b=Qwen/Qwen2.5-Coder-0.5B-Instruct+finetune/adapters/agentcoder-worker-0.5b \
+    --model agentcoder-worker:1.5b=Qwen/Qwen2.5-Coder-1.5B-Instruct+finetune/adapters/agentcoder-worker-1.5b
+agentcoder -w small=agentcoder-worker:0.5b -w medium=agentcoder-worker:1.5b   # 8090'da otomatik bulunur
 ```
 
 **Ölçüm** (4 çekirdekli CPU, AMX var, Qwen2.5-Coder-1.5B, `scripts/bench_backends.py`):
@@ -236,8 +237,15 @@ ekleme görevleri. MBPP: test bölümü, pass@1, greedy.
 |---|---|---|---|
 | `agentcoder-worker:0.5b` v1 (sadece agentic veri) | 79/90 | 16 | 171 (%34.5) |
 | **`agentcoder-worker:0.5b`** (agentic + distill kod) | **80/90** | **6** | **191 (%38.6)** |
+| `qwen2.5-coder:1.5b` (ham) | 2/90 | 0 | 266 (%53.7) |
+| **`agentcoder-worker:1.5b`** (aynı karışım) | **85/90** | **1** | **273 (%55.2)** |
 
-MBPP farkı eşleştirilmiş testte anlamlı: 45 problemi sadece yeni model çözüyor, 25'ini sadece eski (işaret testi p≈0.02).
+1.5B'de agentic eğitim düz kodlamayı bozmadı: MBPP farkı anlamsız (27'ye 20 problem, p≈0.38). Fonksiyon ekleme 6/9,
+bug düzeltme 16/16. Eğitim 15GB RAM'e `--grad-ckpt` ile sığıyor (tepe ~7GB). HF'nin kendi gradient checkpointing'i
+prefix cache'ini sessizce atıyor, yani cevaplar bağlamsız eğitilirdi. `train.py` bu yüzden katmanları kendisi sarıyor.
+CPU'da ~4.5 saat sürüyor, `--max-minutes 110 --resume` ile parça parça koşulabiliyor (devam etmek bit düzeyinde aynı sonucu veriyor).
+
+0.5B'de MBPP farkı eşleştirilmiş testte anlamlı: 45 problemi sadece yeni model çözüyor, 25'ini sadece eski (işaret testi p≈0.02).
 Fonksiyon ekleme 2/9'dan 4/9'a çıktı. İlk denemeler daha küçük setteydi (30 görev / 100 problem). Orada 1–2 puanlık
 farklar gürültüydü, fp16 yuvarlaması bile o kadar oynatıyor. Büyük eval o yüzden şart:
 
@@ -275,7 +283,7 @@ Tool calling'i iyi olan modeller daha iyi sonuç verir:
 
 - `qwen2.5-coder:7b` / `14b`: hızlı, düzgün
 - `qwen3:8b`, `qwen3-coder:30b`: daha akıllı, daha aç
-- 3B altı ham modeller tam bir piyango. İşçi olarak fine-tune'lu `agentcoder-worker` kullanın
+- 3B altı ham modeller tam bir piyango (ham 1.5B: 2/90). İşçi olarak fine-tune'lu `agentcoder-worker:0.5b` / `:1.5b` kullanın
 
 ## Lisans
 
