@@ -774,7 +774,7 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
         if r.max_tokens is None:
             # a thinking model (qwen3.5 & co.) can think for thousands of tokens before a 220-word brief
             r.max_tokens, r.extra = REFINER_MAX_TOKENS, dict(NO_THINK)
-            if ram_gb() < 24:
+            if ram_gb() < 24 and r.model != self.llm.model:
                 # on a small machine a 9B refiner that stays loaded gets the orchestrator OOM-killed
                 r.extra["keep_alive"] = 0  # Ollama: unload right after the brief
         try:
