@@ -10,12 +10,14 @@ import argparse
 import atexit
 import difflib
 import fnmatch
+import http.client
 import json
 import os
 import platform
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -348,7 +350,7 @@ class LLM:
         content, calls, got, rest = "", {}, False, []
         self.partial = ""
         with self._req("/chat/completions", body) as resp:
-            for raw in resp:
+            for raw in self._lines(resp):
                 line = raw.decode("utf-8", "replace").strip()
                 if not line:
                     continue
@@ -396,6 +398,13 @@ class LLM:
         return content, [{"id": c["id"] or f"call_{i}_{random.randrange(16**6):06x}",
                           "name": c["name"], "arguments": c["arguments"] or "{}"}
                          for i, c in sorted(calls.items())]
+
+    def _lines(self, resp):
+        """Iterate a streamed response; a stalled or dropped stream becomes an LLMError."""
+        try:
+            yield from resp
+        except (OSError, http.client.HTTPException) as e:  # TimeoutError is an OSError
+            raise LLMError(0, f"stream from {self.base_url} broke off ({type(e).__name__}: {e or 'timed out'})") from None
 
     @staticmethod
     def _merge_call(calls: dict, tc: dict, sink) -> None:
@@ -1078,16 +1087,25 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
     def t_bash(self, command, timeout=120):
         self.ask("Bash", "Run command", [cyan(clip(line, term_width() - 8)) for line in command.splitlines()])
         self.spinner.start("Running")
+        # own process group, so a timeout also kills what the shell started (a `go run` binary
+        # stuck in a loop would otherwise keep a core busy and starve a local model)
+        group = os.name == "posix"
+        proc = subprocess.Popen(command, shell=True, cwd=self.cwd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, errors="replace",
+                                stdin=subprocess.DEVNULL, start_new_session=group)
         try:
-            r = subprocess.run(command, shell=True, cwd=self.cwd, capture_output=True, text=True,
-                               errors="replace", timeout=int(timeout or 120), stdin=subprocess.DEVNULL)
+            stdout, stderr = proc.communicate(timeout=int(timeout or 120))
         except subprocess.TimeoutExpired:
-            raise ToolError(f"Command timed out after {timeout}s.") from None
+            kill_tree(proc, group)
+            raise ToolError(f"Command timed out after {timeout}s; it and its child processes were killed.") from None
+        except BaseException:
+            kill_tree(proc, group)
+            raise
         finally:
             self.spinner.stop()
-        out = (r.stdout or "") + (r.stderr or "")
-        if r.returncode:
-            out += f"\n[exit code {r.returncode}]"
+        out = (stdout or "") + (stderr or "")
+        if proc.returncode:
+            out += f"\n[exit code {proc.returncode}]"
         return out.strip() or "(no output)"
 
     def _walk(self, base: str):
@@ -1199,6 +1217,21 @@ def canon(name: str) -> str:
     s = re.sub(r"-(i?q\d[\w-]*|f16|bf16|fp16|fp8|int4|int8|awq|gptq|\d+bit)$", "", s)
     s = re.sub(r"-(instruct|chat|it|latest)(?=-|$)", "", s)
     return s
+
+
+def kill_tree(proc, group: bool) -> None:
+    """Kill a shell and everything it started, then reap it."""
+    try:
+        if group:
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.communicate(timeout=5)
+    except (subprocess.TimeoutExpired, ValueError):
+        pass
 
 
 def discover(timeout: float = 0.5) -> list:
