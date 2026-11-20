@@ -10,6 +10,7 @@ Small Qwen models ship <tool_call>/</tool_call> with identical, untrained embedd
 the output layer), so LoRA alone can never make the model emit them. Those rows are trained too.
 """
 import argparse
+import functools
 import json
 import math
 import os
@@ -18,7 +19,7 @@ import time
 
 import torch
 from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 
 def encode(tok, sample):
@@ -39,6 +40,26 @@ def encode(tok, sample):
     # the last prefix token must run with gradients: it predicts the first assistant token
     prefix = mask.index(True) - 1
     return ids, mask, prefix
+
+
+class PrefixCache(DynamicCache):
+    """A cache that is only read: update() returns prefix + new K/V but stores nothing.
+
+    With activation checkpointing a layer runs twice (forward, then again in backward); a normal
+    cache would get the rest's K/V appended twice. HF's own checkpointing avoids that by dropping
+    the cache altogether, which silently trains on the rest without its prefix.
+    """
+
+    def update(self, key_states, value_states, layer_idx, *args, **kwargs):
+        layer = self.layers[layer_idx]
+        return torch.cat([layer.keys, key_states], -2), torch.cat([layer.values, value_states], -2)
+
+
+def checkpoint_layers(core):
+    """Recompute each decoder layer's activations in backward instead of keeping them."""
+    from torch.utils.checkpoint import checkpoint
+    for layer in core.layers:
+        layer.forward = functools.partial(checkpoint, layer.forward, use_reentrant=False)
 
 
 @torch.no_grad()
@@ -68,6 +89,8 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="use only the first N samples")
     ap.add_argument("--threads", type=int, default=os.cpu_count())
     ap.add_argument("--stats", action="store_true", help="print token stats and exit")
+    ap.add_argument("--grad-ckpt", action="store_true",
+                    help="recompute activations in backward: slower, but 1.5B+ fits in ~15GB RAM")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     torch.manual_seed(0)
@@ -95,6 +118,8 @@ def main():
                      target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
                      trainable_token_indices=special)
     model = get_peft_model(model, cfg)
+    if args.grad_ckpt:
+        checkpoint_layers(model.base_model.model.model)
     for p in model.parameters():
         if p.requires_grad:
             p.data = p.data.float()
@@ -129,6 +154,7 @@ def main():
         with torch.autocast("cpu", dtype=torch.bfloat16):
             with torch.no_grad():
                 pkv = core(input_ids=x[:, :prefix], use_cache=True).past_key_values
+            pkv.__class__ = PrefixCache  # rest pass reads the prefix K/V without appending to it
             rest = x[0, prefix:]
             h = core(input_ids=rest[None], past_key_values=pkv, use_cache=True).last_hidden_state[0]
             # position j predicts rest[j+1]; keep positions whose next token is an assistant token
