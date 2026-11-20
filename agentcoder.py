@@ -47,6 +47,9 @@ SUB_MAX_STEPS = 20
 DEFAULT_WORKERS = "small=qwen2.5-coder:0.5b,medium=qwen2.5-coder:1.5b,large=qwen2.5-coder:3b"
 READONLY_TIERS = {"small"}
 DEFAULT_REFINER = "qwen3.5:9b"
+REFINER_MAX_TOKENS = 1024
+# Thinking off: Ollama reads reasoning_effort, llama.cpp / vLLM / SGLang read chat_template_kwargs.
+NO_THINK = {"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}}
 REFINER_PROMPT = """You are the prompt refiner in a team of coding agents. You never write code and never talk to \
 the user. You turn the user's raw message into a clear brief for the orchestrator agent that will do the work.
 
@@ -300,6 +303,7 @@ class LLM:
         self.partial = ""
         self.usage = None
         self.max_tokens = None
+        self.extra = {}       # extra request fields, e.g. to switch thinking off
         self.backend = ""     # which local server was picked (auto mode)
         self.pinned = False   # True when the user gave an explicit URL for this model
 
@@ -330,6 +334,7 @@ class LLM:
             body["tools"] = tools
         if self.max_tokens:
             body["max_tokens"] = self.max_tokens
+        body.update(self.extra)
         router = TagRouter(sink)
         content, calls, got, rest = "", {}, False, []
         self.partial = ""
@@ -725,8 +730,18 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
         req = [{"role": "system", "content": REFINER_PROMPT},
                {"role": "user", "content": f"{ctx}\nUser's new message:\n{raw}"}]
         self.spinner.start("Refining prompt")
+        r = self.refiner
+        if r.max_tokens is None:
+            # a thinking model (qwen3.5 & co.) can think for thousands of tokens before a 220-word brief
+            r.max_tokens, r.extra = REFINER_MAX_TOKENS, dict(NO_THINK)
         try:
-            out, _ = self.refiner.chat(req, None, lambda *_: None)
+            try:
+                out, _ = r.chat(req, None, lambda *_: None)
+            except LLMError as e:
+                if not r.extra or e.code not in (400, 422):
+                    raise
+                r.extra = {}  # this server rejects the no-think fields; ask again without them
+                out, _ = r.chat(req, None, lambda *_: None)
         except LLMError as e:
             self.spinner.stop()
             w(yellow(f"  ! refiner failed, continuing without brief: {clip(str(e), 100)}\n"))
