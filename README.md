@@ -282,6 +282,27 @@ ve `ollama create` çalıştırır. Ollama'nın safetensors importu Qwen2'yi des
 TEMPLATE yazılmaz: Ollama'nın Go şablonu tool argümanlarının anahtarlarını alfabetik sıralıyor ve işçi `path`'i
 atlamaya başlıyor, GGUF içindeki orijinal şablon kullanılır. Export edilen işçiler: 0.5B 27/30, 1.5B 29/30, 0 tool hatası.
 
+## Uçtan uca test (CPU, 4 çekirdek)
+
+Türkçe istek: "Dijkstra'yı Python/JS/Go/Rust/C++'ta yaz, aynı grafı kullan, heap kullan, hepsini derle, çalıştır,
+çıktıların aynı olduğunu doğrula". Düzenleyici + şef `qwen3.5:9b --no-think`, işçiler `agentcoder-worker:0.5b/1.5b`.
+
+| Dil | Sonuç |
+|---|---|
+| Python, Go, Rust, C++ | doğru ve birebir aynı çıktı (Rust ve C++ derleme hatalarını şef kendi düzeltti) |
+| JavaScript | çıktı yok: `pushPq`'nun argüman sırası ters; şef 40 dakikada bulamadı |
+
+Adım başına ~3 dakika, toplam ~2 saat. Testin bulup düzelttiğimiz hataları: `bash` timeout'unda geride kalan
+süreçler (artık bütün süreç grubu öldürülüyor), yakalanmayan akış timeout'u, aynı komutu tekrar tekrar çalıştıran
+işçi (döngü koruması) ve işçilere Türkçe yazılan görevler (şefe bir kez İngilizce yazması söyleniyor).
+
+Bilinen zayıflıklar:
+- 9B şef kendiliğinden işçilere neredeyse hiç iş vermiyor; açıkça istense de bazen kendisi yapıyor
+- 1.5B işçi, açık komut listesiyle verilen işi kusursuz yapıyor (5 komut, 16 s). Ama göreve "kodu değiştirme"
+  yazılınca read-only örneklerden ezberlediği "I'm read-only" kalıbına kayıyor ve sonucu uyduruyor. Şef işçi
+  raporunu kontrol etmeli; eğitim verisine medium rolde "değiştirme ama çalıştır" örnekleri eklenmeli
+- Küçük işçilere hata ayıklama verilmemeli: 1.5B, JS hatasına yanlış teşhis koydu
+
 ## Model önerileri
 
 Tool calling'i iyi olan modeller daha iyi sonuç verir:
