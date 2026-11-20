@@ -654,6 +654,8 @@ class Agent:
     # ── context ──
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.system_prompt()}]
+        self.last_call = (None, None, 0)   # (call key, result, times in a row) for the loop guard
+        self.nudged_tasks = set()           # task texts already sent back for an English rewrite
 
     def system_prompt(self) -> str:
         try:
@@ -857,7 +859,7 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
 
         results = []
         for c in calls:
-            out = "Skipped: the user stopped this turn." if self.stop_turn else self.run_tool(c)
+            out = "Skipped: the user stopped this turn." if self.stop_turn else self.loop_guard(c, self.run_tool(c))
             if self.text_tools:
                 results.append(f'<tool_result name="{c["name"]}">\n{out}\n</tool_result>')
             else:
@@ -884,6 +886,18 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
                 if self.text_tools and m is self.messages[-1] and parse_text_calls(m["content"]):
                     self.messages.append({"role": "user", "content": "[interrupted by the user]"})
                 break
+
+    def loop_guard(self, call: dict, out: str) -> str:
+        """Small models can get stuck repeating one call (seen: a 1.5B worker ran the same failing
+        test command 15 times). Point it out once a call has returned the same result 3 times in a row."""
+        key = (call["name"], call["arguments"] if isinstance(call["arguments"], str) else json.dumps(call["arguments"]))
+        prev_key, prev_out, n = self.last_call
+        n = n + 1 if (key, out) == (prev_key, prev_out) else 1
+        self.last_call = (key, out, n)
+        if n >= 3:
+            out += (f"\n\n[You have made this exact call {n} times in a row with the same result. Repeating it "
+                    "will not change anything: try a different approach, or reply with a report of what you found.]")
+        return out
 
     def run_tool(self, call: dict) -> str:
         name, raw = call["name"], call["arguments"]
@@ -1068,6 +1082,10 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
         llm = self.workers.get(agent)
         if not llm:
             raise ToolError(f"No sub-agent '{agent}'. Available: {', '.join(self.workers) or 'none'}.")
+        if not_english(task) and task not in self.nudged_tasks:
+            self.nudged_tasks.add(task)  # only once per text: never block a task outright
+            raise ToolError("Write the task in English: the sub-agents were trained on English and misread other "
+                            "languages. Keep file names, identifiers and quoted text as they are, then call task again.")
         sub = Agent(llm, self.cwd, ctx_limit=self.ctx_limit, role=agent, parent=self)
         sub.messages.append({"role": "user", "content": task})
         t0 = time.time()
@@ -1218,6 +1236,13 @@ def canon(name: str) -> str:
     s = re.sub(r"-(i?q\d[\w-]*|f16|bf16|fp16|fp8|int4|int8|awq|gptq|\d+bit)$", "", s)
     s = re.sub(r"-(instruct|chat|it|latest)(?=-|$)", "", s)
     return s
+
+
+def not_english(text: str) -> bool:
+    """True when a noticeable share of the letters is non-ASCII (Turkish, Russian, Chinese...)."""
+    text = re.sub(r"`[^`]*`|'[^'\n]*'|\"[^\"\n]*\"|\S+\.\w{1,5}\b", " ", text)  # quotes, file names
+    letters = [ch for ch in text if ch.isalpha()]
+    return len(letters) >= 20 and sum(not ch.isascii() for ch in letters) / len(letters) > 0.03
 
 
 def kill_tree(proc, group: bool) -> None:
