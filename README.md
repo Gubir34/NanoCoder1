@@ -277,11 +277,20 @@ python finetune/code_eval.py --mbpp /path/to/mbpp --model w --n 100
 python finetune/export_ollama.py --adapter finetune/adapters/my-worker   # Ollama'ya aktar (opsiyonel)
 ```
 
+`export_ollama.py` adaptörü base'e birleştirir, llama.cpp ile q8_0 GGUF'a çevirir (`--llama-cpp` ya da `LLAMA_CPP`)
+ve `ollama create` çalıştırır. Ollama'nın safetensors importu Qwen2'yi desteklemiyor, o yüzden GGUF. Modelfile'a
+TEMPLATE yazılmaz: Ollama'nın Go şablonu tool argümanlarının anahtarlarını alfabetik sıralıyor ve işçi `path`'i
+atlamaya başlıyor, GGUF içindeki orijinal şablon kullanılır. Export edilen işçiler: 0.5B 27/30, 1.5B 29/30, 0 tool hatası.
+
 ## Model önerileri
 
 Tool calling'i iyi olan modeller daha iyi sonuç verir:
 
-- `qwen2.5-coder:7b` / `14b`: hızlı, düzgün
+- `qwen2.5-coder:7b` / `14b`: hızlı, ama şef olarak tool çağrısını bazen ```json bloğu olarak yazıyor (AgentCoder
+  bunu yakalıyor) ya da kodu dosyaya yazmak yerine sohbete döküyor
+- `qwen3.5:9b --no-think`: GPU'suz makinede en güvenilir şef. `--no-think` (`AGENTCODER_NO_THINK=1`) düşünmeyi
+  kapatır; açıkken 9B her adımda binlerce token düşünüyor. Düzenleyici zaten düşünmesiz çalışır ve RAM 24GB'tan azsa
+  brief'ten sonra bellekten atılır (yoksa 9B + 7B aynı anda yüklenip OOM yer)
 - `qwen3:8b`, `qwen3-coder:30b`: daha akıllı, daha aç
 - 3B altı ham modeller tam bir piyango (ham 1.5B: 2/90). İşçi olarak fine-tune'lu `agentcoder-worker:0.5b` / `:1.5b` kullanın
 

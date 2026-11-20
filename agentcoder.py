@@ -691,6 +691,7 @@ You are the orchestrator. With the `task` tool you can delegate subtasks to smal
 - Sub-agents do NOT see this conversation. Give each one complete, specific instructions and say what to report.
 - They are weaker than you. Keep hard reasoning and tricky edits for yourself; check their reports before relying on them.
 - Delegate when it saves work (broad searches, reading many files, routine edits). For one small file, just do it yourself.
+- Building, running tests and collecting their output is a good fit too: the long logs stay out of your context.
 - Write `task` descriptions in English, whatever language the user speaks: the sub-agents were trained on English. \
 Keep file names, identifiers and quoted text exactly as the user wrote them."""
         if self.refiner:
