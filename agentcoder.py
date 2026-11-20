@@ -1582,6 +1582,9 @@ def main(argv=None) -> int:
                     help="model that rewrites your prompt into a brief for the orchestrator "
                          "(MODEL or MODEL@BASE_URL)")
     ap.add_argument("--no-refiner", action="store_true", help="send prompts to the orchestrator as-is")
+    ap.add_argument("--no-think", action="store_true", default=env("AGENTCODER_NO_THINK", "") not in ("", "0"),
+                    help="switch thinking off for the orchestrator and sub-agents (thinking models on a slow CPU "
+                         "can think for minutes per step)")
     ap.add_argument("-C", "--cwd", default=os.getcwd(), help="project directory")
     ap.add_argument("--version", action="version", version=f"agentcoder {VERSION}")
     args = ap.parse_args(argv)
@@ -1597,6 +1600,9 @@ def main(argv=None) -> int:
         refiner.pinned = bool(url)
     chef = LLM(base, args.model, args.api_key)
     chef.pinned = not auto
+    if args.no_think:
+        for llm in (chef, *workers.values()):
+            llm.extra = dict(NO_THINK)
     agent = Agent(chef, args.cwd, yolo=args.yolo,
                   text_tools=args.text_tools, ctx_limit=args.ctx, workers=workers, refiner=refiner)
 
