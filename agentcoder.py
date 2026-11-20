@@ -48,6 +48,15 @@ DEFAULT_WORKERS = "small=qwen2.5-coder:0.5b,medium=qwen2.5-coder:1.5b,large=qwen
 READONLY_TIERS = {"small"}
 DEFAULT_REFINER = "qwen3.5:9b"
 REFINER_MAX_TOKENS = 1024
+
+
+def ram_gb() -> float:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+    except (ValueError, OSError, AttributeError):
+        return 64.0
+
+
 # Thinking off: Ollama reads reasoning_effort, llama.cpp / vLLM / SGLang read chat_template_kwargs.
 NO_THINK = {"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}}
 REFINER_PROMPT = """You are the prompt refiner in a team of coding agents. You never write code and never talk to \
@@ -429,6 +438,37 @@ def parse_text_calls(content: str) -> list:
     return calls
 
 
+JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.S)
+
+
+def parse_json_calls(content: str, names: set) -> tuple:
+    """Tool calls written as JSON instead of <tool_call> (qwen2.5-coder does this): ```json {"name":..,
+    "arguments":..}``` or a bare JSON object. Only objects naming a known tool count.
+    Returns (calls, content without those blocks)."""
+    def calls_in(raw):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        objs = obj if isinstance(obj, list) else [obj]
+        if not objs or not all(isinstance(o, dict) and o.get("name") in names
+                               and isinstance(o.get("arguments", o.get("parameters")), dict) for o in objs):
+            return []
+        return [{"id": f"call_j{random.randrange(16**8):08x}", "name": o["name"],
+                 "arguments": json.dumps(o.get("arguments", o.get("parameters")))} for o in objs]
+
+    calls, rest = [], content
+    for m in JSON_FENCE_RE.finditer(content):
+        found = calls_in(m.group(1))
+        if found:
+            calls += found
+            rest = rest.replace(m.group(0), "")
+    if not calls and content.strip()[:1] in "{[":
+        calls = calls_in(content.strip())
+        rest = "" if calls else content
+    return calls, rest.strip()
+
+
 # ───────────────────────────────── tools ───────────────────────────────────
 
 def _tool(name, desc, props, required):
@@ -734,6 +774,9 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
         if r.max_tokens is None:
             # a thinking model (qwen3.5 & co.) can think for thousands of tokens before a 220-word brief
             r.max_tokens, r.extra = REFINER_MAX_TOKENS, dict(NO_THINK)
+            if ram_gb() < 24:
+                # on a small machine a 9B refiner that stays loaded gets the orchestrator OOM-killed
+                r.extra["keep_alive"] = 0  # Ollama: unload right after the brief
         try:
             try:
                 out, _ = r.chat(req, None, lambda *_: None)
@@ -794,6 +837,8 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
             self.messages.append({"role": "assistant", "content": clean})
         else:
             calls = calls or text_calls  # some models leak calls into plain text
+            if not calls:
+                calls, clean = parse_json_calls(clean, {t["function"]["name"] for t in self.schemas()})
             msg = {"role": "assistant", "content": TOOL_CALL_RE.sub("", clean).strip()}
             if calls:
                 msg["tool_calls"] = [{"id": c["id"], "type": "function", "function": {
