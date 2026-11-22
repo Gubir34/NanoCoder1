@@ -10,12 +10,14 @@ import argparse
 import atexit
 import difflib
 import fnmatch
+import http.client
 import json
 import os
 import platform
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -38,6 +40,7 @@ KNOWN_BACKENDS = [("agentcoder", "http://127.0.0.1:8090/v1"), ("ollama", "http:/
                   ("llama.cpp", "http://127.0.0.1:8083/v1"), ("vllm", "http://127.0.0.1:8000/v1"),
                   ("sglang", "http://127.0.0.1:30000/v1"), ("lmstudio", "http://127.0.0.1:1234/v1")]
 BENCH_CACHE = os.path.expanduser("~/.agentcoder/bench.json")
+CONFIG_FILE = os.path.expanduser("~/.agentcoder/config")
 IGNORED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "env", "dist", "build",
                 ".next", ".mypy_cache", ".pytest_cache", ".idea", ".vscode", "target", ".tox"}
 PROJECT_NOTES = ("AGENTCODER.md", "AGENTS.md", "CLAUDE.md")
@@ -47,6 +50,18 @@ SUB_MAX_STEPS = 20
 DEFAULT_WORKERS = "small=qwen2.5-coder:0.5b,medium=qwen2.5-coder:1.5b,large=qwen2.5-coder:3b"
 READONLY_TIERS = {"small"}
 DEFAULT_REFINER = "qwen3.5:9b"
+REFINER_MAX_TOKENS = 1024
+
+
+def ram_gb() -> float:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 2**30
+    except (ValueError, OSError, AttributeError):
+        return 64.0
+
+
+# Thinking off: Ollama reads reasoning_effort, llama.cpp / vLLM / SGLang read chat_template_kwargs.
+NO_THINK = {"reasoning_effort": "none", "chat_template_kwargs": {"enable_thinking": False}}
 REFINER_PROMPT = """You are the prompt refiner in a team of coding agents. You never write code and never talk to \
 the user. You turn the user's raw message into a clear brief for the orchestrator agent that will do the work.
 
@@ -300,6 +315,7 @@ class LLM:
         self.partial = ""
         self.usage = None
         self.max_tokens = None
+        self.extra = {}       # extra request fields, e.g. to switch thinking off
         self.backend = ""     # which local server was picked (auto mode)
         self.pinned = False   # True when the user gave an explicit URL for this model
 
@@ -330,11 +346,12 @@ class LLM:
             body["tools"] = tools
         if self.max_tokens:
             body["max_tokens"] = self.max_tokens
+        body.update(self.extra)
         router = TagRouter(sink)
         content, calls, got, rest = "", {}, False, []
         self.partial = ""
         with self._req("/chat/completions", body) as resp:
-            for raw in resp:
+            for raw in self._lines(resp):
                 line = raw.decode("utf-8", "replace").strip()
                 if not line:
                     continue
@@ -383,6 +400,13 @@ class LLM:
                           "name": c["name"], "arguments": c["arguments"] or "{}"}
                          for i, c in sorted(calls.items())]
 
+    def _lines(self, resp):
+        """Iterate a streamed response; a stalled or dropped stream becomes an LLMError."""
+        try:
+            yield from resp
+        except (OSError, http.client.HTTPException) as e:  # TimeoutError is an OSError
+            raise LLMError(0, f"stream from {self.base_url} broke off ({type(e).__name__}: {e or 'timed out'})") from None
+
     @staticmethod
     def _merge_call(calls: dict, tc: dict, sink) -> None:
         idx = tc.get("index")
@@ -422,6 +446,37 @@ def parse_text_calls(content: str) -> list:
         calls.append({"id": f"call_t{i}_{random.randrange(16**6):06x}", "name": name,
                       "arguments": args if isinstance(args, str) else json.dumps(args)})
     return calls
+
+
+JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.S)
+
+
+def parse_json_calls(content: str, names: set) -> tuple:
+    """Tool calls written as JSON instead of <tool_call> (qwen2.5-coder does this): ```json {"name":..,
+    "arguments":..}``` or a bare JSON object. Only objects naming a known tool count.
+    Returns (calls, content without those blocks)."""
+    def calls_in(raw):
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        objs = obj if isinstance(obj, list) else [obj]
+        if not objs or not all(isinstance(o, dict) and o.get("name") in names
+                               and isinstance(o.get("arguments", o.get("parameters")), dict) for o in objs):
+            return []
+        return [{"id": f"call_j{random.randrange(16**8):08x}", "name": o["name"],
+                 "arguments": json.dumps(o.get("arguments", o.get("parameters")))} for o in objs]
+
+    calls, rest = [], content
+    for m in JSON_FENCE_RE.finditer(content):
+        found = calls_in(m.group(1))
+        if found:
+            calls += found
+            rest = rest.replace(m.group(0), "")
+    if not calls and content.strip()[:1] in "{[":
+        calls = calls_in(content.strip())
+        rest = "" if calls else content
+    return calls, rest.strip()
 
 
 # ───────────────────────────────── tools ───────────────────────────────────
@@ -600,6 +655,8 @@ class Agent:
     # ── context ──
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self.system_prompt()}]
+        self.last_call = (None, None, 0)   # (call key, result, times in a row) for the loop guard
+        self.nudged_tasks = set()           # task texts already sent back for an English rewrite
 
     def system_prompt(self) -> str:
         try:
@@ -637,6 +694,7 @@ You are the orchestrator. With the `task` tool you can delegate subtasks to smal
 - Sub-agents do NOT see this conversation. Give each one complete, specific instructions and say what to report.
 - They are weaker than you. Keep hard reasoning and tricky edits for yourself; check their reports before relying on them.
 - Delegate when it saves work (broad searches, reading many files, routine edits). For one small file, just do it yourself.
+- Building, running tests and collecting their output is a good fit too: the long logs stay out of your context.
 - Write `task` descriptions in English, whatever language the user speaks: the sub-agents were trained on English. \
 Keep file names, identifiers and quoted text exactly as the user wrote them."""
         if self.refiner:
@@ -725,8 +783,21 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
         req = [{"role": "system", "content": REFINER_PROMPT},
                {"role": "user", "content": f"{ctx}\nUser's new message:\n{raw}"}]
         self.spinner.start("Refining prompt")
+        r = self.refiner
+        if r.max_tokens is None:
+            # a thinking model (qwen3.5 & co.) can think for thousands of tokens before a 220-word brief
+            r.max_tokens, r.extra = REFINER_MAX_TOKENS, dict(NO_THINK)
+            if ram_gb() < 24 and r.model != self.llm.model:
+                # on a small machine a 9B refiner that stays loaded gets the orchestrator OOM-killed
+                r.extra["keep_alive"] = 0  # Ollama: unload right after the brief
         try:
-            out, _ = self.refiner.chat(req, None, lambda *_: None)
+            try:
+                out, _ = r.chat(req, None, lambda *_: None)
+            except LLMError as e:
+                if not r.extra or e.code not in (400, 422):
+                    raise
+                r.extra = {}  # this server rejects the no-think fields; ask again without them
+                out, _ = r.chat(req, None, lambda *_: None)
         except LLMError as e:
             self.spinner.stop()
             w(yellow(f"  ! refiner failed, continuing without brief: {clip(str(e), 100)}\n"))
@@ -779,6 +850,8 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
             self.messages.append({"role": "assistant", "content": clean})
         else:
             calls = calls or text_calls  # some models leak calls into plain text
+            if not calls:
+                calls, clean = parse_json_calls(clean, {t["function"]["name"] for t in self.schemas()})
             msg = {"role": "assistant", "content": TOOL_CALL_RE.sub("", clean).strip()}
             if calls:
                 msg["tool_calls"] = [{"id": c["id"], "type": "function", "function": {
@@ -787,7 +860,7 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
 
         results = []
         for c in calls:
-            out = "Skipped: the user stopped this turn." if self.stop_turn else self.run_tool(c)
+            out = "Skipped: the user stopped this turn." if self.stop_turn else self.loop_guard(c, self.run_tool(c))
             if self.text_tools:
                 results.append(f'<tool_result name="{c["name"]}">\n{out}\n</tool_result>')
             else:
@@ -814,6 +887,18 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
                 if self.text_tools and m is self.messages[-1] and parse_text_calls(m["content"]):
                     self.messages.append({"role": "user", "content": "[interrupted by the user]"})
                 break
+
+    def loop_guard(self, call: dict, out: str) -> str:
+        """Small models can get stuck repeating one call (seen: a 1.5B worker ran the same failing
+        test command 15 times). Point it out once a call has returned the same result 3 times in a row."""
+        key = (call["name"], call["arguments"] if isinstance(call["arguments"], str) else json.dumps(call["arguments"]))
+        prev_key, prev_out, n = self.last_call
+        n = n + 1 if (key, out) == (prev_key, prev_out) else 1
+        self.last_call = (key, out, n)
+        if n >= 3:
+            out += (f"\n\n[You have made this exact call {n} times in a row with the same result. Repeating it "
+                    "will not change anything: try a different approach, or reply with a report of what you found.]")
+        return out
 
     def run_tool(self, call: dict) -> str:
         name, raw = call["name"], call["arguments"]
@@ -998,6 +1083,10 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
         llm = self.workers.get(agent)
         if not llm:
             raise ToolError(f"No sub-agent '{agent}'. Available: {', '.join(self.workers) or 'none'}.")
+        if not_english(task) and task not in self.nudged_tasks:
+            self.nudged_tasks.add(task)  # only once per text: never block a task outright
+            raise ToolError("Write the task in English: the sub-agents were trained on English and misread other "
+                            "languages. Keep file names, identifiers and quoted text as they are, then call task again.")
         sub = Agent(llm, self.cwd, ctx_limit=self.ctx_limit, role=agent, parent=self)
         sub.messages.append({"role": "user", "content": task})
         t0 = time.time()
@@ -1013,21 +1102,30 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
             report += f"\n\n[sub-agent hit its {SUB_MAX_STEPS}-step limit; the work may be incomplete]"
         if sub.stop_turn:
             report += "\n\n[the user stopped this sub-agent]"
-        return report, f"{agent} agent ({llm.model}) done · {n_calls} tool call{"s" if n_calls != 1 else ""} · {int(time.time() - t0)}s"
+        return report, f"{agent} agent ({llm.model}) done · {n_calls} tool call{'s' if n_calls != 1 else ''} · {int(time.time() - t0)}s"
 
     def t_bash(self, command, timeout=120):
         self.ask("Bash", "Run command", [cyan(clip(line, term_width() - 8)) for line in command.splitlines()])
         self.spinner.start("Running")
+        # own process group, so a timeout also kills what the shell started (a `go run` binary
+        # stuck in a loop would otherwise keep a core busy and starve a local model)
+        group = os.name == "posix"
+        proc = subprocess.Popen(command, shell=True, cwd=self.cwd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, errors="replace",
+                                stdin=subprocess.DEVNULL, start_new_session=group)
         try:
-            r = subprocess.run(command, shell=True, cwd=self.cwd, capture_output=True, text=True,
-                               errors="replace", timeout=int(timeout or 120), stdin=subprocess.DEVNULL)
+            stdout, stderr = proc.communicate(timeout=int(timeout or 120))
         except subprocess.TimeoutExpired:
-            raise ToolError(f"Command timed out after {timeout}s.") from None
+            kill_tree(proc, group)
+            raise ToolError(f"Command timed out after {timeout}s; it and its child processes were killed.") from None
+        except BaseException:
+            kill_tree(proc, group)
+            raise
         finally:
             self.spinner.stop()
-        out = (r.stdout or "") + (r.stderr or "")
-        if r.returncode:
-            out += f"\n[exit code {r.returncode}]"
+        out = (stdout or "") + (stderr or "")
+        if proc.returncode:
+            out += f"\n[exit code {proc.returncode}]"
         return out.strip() or "(no output)"
 
     def _walk(self, base: str):
@@ -1139,6 +1237,43 @@ def canon(name: str) -> str:
     s = re.sub(r"-(i?q\d[\w-]*|f16|bf16|fp16|fp8|int4|int8|awq|gptq|\d+bit)$", "", s)
     s = re.sub(r"-(instruct|chat|it|latest)(?=-|$)", "", s)
     return s
+
+
+def load_config(path: str = CONFIG_FILE) -> None:
+    """Read AGENTCODER_* settings from KEY=VALUE lines (install.sh writes them). Real env vars win."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        key, sep, val = line.strip().partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[7:].strip()
+        if sep and key.startswith("AGENTCODER_"):
+            os.environ.setdefault(key, val.strip().strip("\"'"))
+
+
+def not_english(text: str) -> bool:
+    """True when a noticeable share of the letters is non-ASCII (Turkish, Russian, Chinese...)."""
+    text = re.sub(r"`[^`]*`|'[^'\n]*'|\"[^\"\n]*\"|\S+\.\w{1,5}\b", " ", text)  # quotes, file names
+    letters = [ch for ch in text if ch.isalpha()]
+    return len(letters) >= 20 and sum(not ch.isascii() for ch in letters) / len(letters) > 0.03
+
+
+def kill_tree(proc, group: bool) -> None:
+    """Kill a shell and everything it started, then reap it."""
+    try:
+        if group:
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.communicate(timeout=5)
+    except (subprocess.TimeoutExpired, ValueError):
+        pass
 
 
 def discover(timeout: float = 0.5) -> list:
@@ -1500,6 +1635,7 @@ def _save_history(path: str) -> None:
 
 
 def main(argv=None) -> int:
+    load_config()
     env = os.environ.get
     ap = argparse.ArgumentParser(prog="agentcoder", description="A tiny local coding agent for your terminal.")
     ap.add_argument("prompt", nargs="*", help="run one prompt non-interactively and exit")
@@ -1522,6 +1658,9 @@ def main(argv=None) -> int:
                     help="model that rewrites your prompt into a brief for the orchestrator "
                          "(MODEL or MODEL@BASE_URL)")
     ap.add_argument("--no-refiner", action="store_true", help="send prompts to the orchestrator as-is")
+    ap.add_argument("--no-think", action="store_true", default=env("AGENTCODER_NO_THINK", "") not in ("", "0"),
+                    help="switch thinking off for the orchestrator and sub-agents (thinking models on a slow CPU "
+                         "can think for minutes per step)")
     ap.add_argument("-C", "--cwd", default=os.getcwd(), help="project directory")
     ap.add_argument("--version", action="version", version=f"agentcoder {VERSION}")
     args = ap.parse_args(argv)
@@ -1537,6 +1676,9 @@ def main(argv=None) -> int:
         refiner.pinned = bool(url)
     chef = LLM(base, args.model, args.api_key)
     chef.pinned = not auto
+    if args.no_think:
+        for llm in (chef, *workers.values()):
+            llm.extra = dict(NO_THINK)
     agent = Agent(chef, args.cwd, yolo=args.yolo,
                   text_tools=args.text_tools, ctx_limit=args.ctx, workers=workers, refiner=refiner)
 

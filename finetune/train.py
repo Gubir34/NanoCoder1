@@ -10,6 +10,7 @@ Small Qwen models ship <tool_call>/</tool_call> with identical, untrained embedd
 the output layer), so LoRA alone can never make the model emit them. Those rows are trained too.
 """
 import argparse
+import functools
 import json
 import math
 import os
@@ -18,7 +19,7 @@ import time
 
 import torch
 from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 
 def encode(tok, sample):
@@ -39,6 +40,26 @@ def encode(tok, sample):
     # the last prefix token must run with gradients: it predicts the first assistant token
     prefix = mask.index(True) - 1
     return ids, mask, prefix
+
+
+class PrefixCache(DynamicCache):
+    """A cache that is only read: update() returns prefix + new K/V but stores nothing.
+
+    With activation checkpointing a layer runs twice (forward, then again in backward); a normal
+    cache would get the rest's K/V appended twice. HF's own checkpointing avoids that by dropping
+    the cache altogether, which silently trains on the rest without its prefix.
+    """
+
+    def update(self, key_states, value_states, layer_idx, *args, **kwargs):
+        layer = self.layers[layer_idx]
+        return torch.cat([layer.keys, key_states], -2), torch.cat([layer.values, value_states], -2)
+
+
+def checkpoint_layers(core):
+    """Recompute each decoder layer's activations in backward instead of keeping them."""
+    from torch.utils.checkpoint import checkpoint
+    for layer in core.layers:
+        layer.forward = functools.partial(checkpoint, layer.forward, use_reentrant=False)
 
 
 @torch.no_grad()
@@ -68,6 +89,11 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="use only the first N samples")
     ap.add_argument("--threads", type=int, default=os.cpu_count())
     ap.add_argument("--stats", action="store_true", help="print token stats and exit")
+    ap.add_argument("--grad-ckpt", action="store_true",
+                    help="recompute activations in backward: slower, but 1.5B+ fits in ~15GB RAM")
+    ap.add_argument("--max-minutes", type=float, default=0,
+                    help="stop after this long, saving a checkpoint in --out; rerun with --resume to continue")
+    ap.add_argument("--resume", action="store_true", help="continue from the checkpoint in --out")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     torch.manual_seed(0)
@@ -95,6 +121,8 @@ def main():
                      target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
                      trainable_token_indices=special)
     model = get_peft_model(model, cfg)
+    if args.grad_ckpt:
+        checkpoint_layers(model.base_model.model.model)
     for p in model.parameters():
         if p.requires_grad:
             p.data = p.data.float()
@@ -121,14 +149,29 @@ def main():
         order += perm
     order = order[: int(len(data) * args.epochs)]
 
+    ckpt_path = os.path.join(args.out, "checkpoint.pt")
+    named = {n: p for n, p in model.named_parameters() if p.requires_grad}
+    start, step = 0, 0
+    if args.resume and os.path.exists(ckpt_path):
+        ck = torch.load(ckpt_path, weights_only=False)
+        with torch.no_grad():
+            for n, v in ck["params"].items():
+                named[n].copy_(v)
+        opt.load_state_dict(ck["opt"])
+        sched.load_state_dict(ck["sched"])
+        torch.set_rng_state(ck["rng"])
+        start, step = ck["next"], ck["step"]
+        print(f"resumed at sample {start}/{len(order)} (step {step}/{total})", flush=True)
+
     model.train()
-    t0, losses, step = time.time(), [], 0
-    for i, idx in enumerate(order):
-        ids, mask, prefix = data[idx]
+    t0, losses = time.time(), []
+    for i in range(start, len(order)):
+        ids, mask, prefix = data[order[i]]
         x = torch.tensor([ids])
         with torch.autocast("cpu", dtype=torch.bfloat16):
             with torch.no_grad():
                 pkv = core(input_ids=x[:, :prefix], use_cache=True).past_key_values
+            pkv.__class__ = PrefixCache  # rest pass reads the prefix K/V without appending to it
             rest = x[0, prefix:]
             h = core(input_ids=rest[None], past_key_values=pkv, use_cache=True).last_hidden_state[0]
             # position j predicts rest[j+1]; keep positions whose next token is an assistant token
@@ -143,18 +186,27 @@ def main():
             sched.step()
             opt.zero_grad(set_to_none=True)
             step += 1
+            el, done = time.time() - t0, i + 1 - start
             if step % 5 == 0 or step == total:
-                el = time.time() - t0
                 recent = losses[-args.accum * 5:]
                 print(f"step {step}/{total} · loss {sum(recent) / len(recent):.4f} · "
-                      f"lr {sched.get_last_lr()[0]:.2e} · {el / (i + 1):.1f}s/sample · "
-                      f"eta {el / (i + 1) * (len(order) - i - 1) / 60:.0f}m", flush=True)
+                      f"lr {sched.get_last_lr()[0]:.2e} · {el / done:.1f}s/sample · "
+                      f"eta {el / done * (len(order) - i - 1) / 60:.0f}m", flush=True)
+            if args.max_minutes and el > args.max_minutes * 60 and i < len(order) - 1:
+                os.makedirs(args.out, exist_ok=True)
+                torch.save({"params": {n: p.detach().clone() for n, p in named.items()}, "opt": opt.state_dict(),
+                            "sched": sched.state_dict(), "rng": torch.get_rng_state(), "next": i + 1,
+                            "step": step}, ckpt_path)
+                print(f"paused at step {step}/{total}, checkpoint in {ckpt_path}; rerun with --resume", flush=True)
+                return
     model.eval()
     hits = decision_check(model, tok, data[:40])
     print(f"first-token check: {hits}/{min(40, len(data))} samples start their first reply with the right token")
     os.makedirs(args.out, exist_ok=True)
     model.save_pretrained(args.out)
     tok.save_pretrained(args.out)
+    if os.path.exists(ckpt_path):
+        os.remove(ckpt_path)
     print(f"saved adapter to {args.out} in {(time.time() - t0) / 60:.1f} min")
 
 
