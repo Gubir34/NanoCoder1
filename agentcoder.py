@@ -40,6 +40,7 @@ KNOWN_BACKENDS = [("agentcoder", "http://127.0.0.1:8090/v1"), ("ollama", "http:/
                   ("llama.cpp", "http://127.0.0.1:8083/v1"), ("vllm", "http://127.0.0.1:8000/v1"),
                   ("sglang", "http://127.0.0.1:30000/v1"), ("lmstudio", "http://127.0.0.1:1234/v1")]
 BENCH_CACHE = os.path.expanduser("~/.agentcoder/bench.json")
+CONFIG_FILE = os.path.expanduser("~/.agentcoder/config")
 IGNORED_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "env", "dist", "build",
                 ".next", ".mypy_cache", ".pytest_cache", ".idea", ".vscode", "target", ".tox"}
 PROJECT_NOTES = ("AGENTCODER.md", "AGENTS.md", "CLAUDE.md")
@@ -1101,7 +1102,7 @@ with file paths and line numbers.{" You are read-only: you cannot edit files or 
             report += f"\n\n[sub-agent hit its {SUB_MAX_STEPS}-step limit; the work may be incomplete]"
         if sub.stop_turn:
             report += "\n\n[the user stopped this sub-agent]"
-        return report, f"{agent} agent ({llm.model}) done · {n_calls} tool call{"s" if n_calls != 1 else ""} · {int(time.time() - t0)}s"
+        return report, f"{agent} agent ({llm.model}) done · {n_calls} tool call{'s' if n_calls != 1 else ''} · {int(time.time() - t0)}s"
 
     def t_bash(self, command, timeout=120):
         self.ask("Bash", "Run command", [cyan(clip(line, term_width() - 8)) for line in command.splitlines()])
@@ -1236,6 +1237,21 @@ def canon(name: str) -> str:
     s = re.sub(r"-(i?q\d[\w-]*|f16|bf16|fp16|fp8|int4|int8|awq|gptq|\d+bit)$", "", s)
     s = re.sub(r"-(instruct|chat|it|latest)(?=-|$)", "", s)
     return s
+
+
+def load_config(path: str = CONFIG_FILE) -> None:
+    """Read AGENTCODER_* settings from KEY=VALUE lines (install.sh writes them). Real env vars win."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        key, sep, val = line.strip().partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[7:].strip()
+        if sep and key.startswith("AGENTCODER_"):
+            os.environ.setdefault(key, val.strip().strip("\"'"))
 
 
 def not_english(text: str) -> bool:
@@ -1619,6 +1635,7 @@ def _save_history(path: str) -> None:
 
 
 def main(argv=None) -> int:
+    load_config()
     env = os.environ.get
     ap = argparse.ArgumentParser(prog="agentcoder", description="A tiny local coding agent for your terminal.")
     ap.add_argument("prompt", nargs="*", help="run one prompt non-interactively and exit")
