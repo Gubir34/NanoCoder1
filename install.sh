@@ -19,6 +19,7 @@
 
 main() {
     set -euo pipefail
+    [ -n "${AGENTCODER_DEBUG:-}" ] && set -x
     export PIP_DISABLE_PIP_VERSION_CHECK=1
     REPO="gubir34/NanoCoder1"
     REF="${AGENTCODER_REF:-main}"
@@ -69,7 +70,7 @@ ram_gb() {
 
 find_python() {
     PY=""
-    for p in python3.13 python3.12 python3.11 python3.10 python3.9 python3; do
+    for p in python3.15 python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python3; do
         if have "$p" && "$p" -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null; then
             PY=$(command -v "$p"); break
         fi
@@ -80,24 +81,35 @@ find_python() {
 
 install_cli() {
     say "agentcoder komutu kuruluyor"
+    # download first, visibly and with a time limit: a slow or blocked GitHub then shows up here
+    # instead of as a silent hang inside pip
+    local tmp; tmp=$(mktemp -d)
+    local pkg="$tmp/agentcoder-0.1.0.tar.gz"   # an sdist-style name, which uv insists on
+    info "indiriliyor: $TARBALL"
+    local bar=-sS; [ -t 2 ] && bar=--progress-bar
+    curl -fL --connect-timeout 15 --max-time 300 --retry 2 "$bar" -o "$pkg" "$TARBALL" </dev/null \
+        || die "GitHub'dan indirilemedi: $TARBALL"
+    export UV_HTTP_TIMEOUT=60
     if have pipx; then
-        pipx install --force "$TARBALL" >/dev/null </dev/null || die "pipx install başarısız"
-        info "pipx ile kuruldu"
+        info "pipx ile kuruluyor"
+        pipx install --force --pip-args="--timeout 30" "$pkg" </dev/null || die "pipx install başarısız"
     elif have uv; then
-        uv tool install -q --force --python "$PY" "$TARBALL" </dev/null || die "uv tool install başarısız"
-        info "uv tool ile kuruldu"
+        info "uv tool ile kuruluyor"
+        uv tool install --force --python "$PY" "$pkg" </dev/null || die "uv tool install başarısız"
     else
+        info "$HOME_DIR/venv içine kuruluyor"
         # a private venv: works on PEP 668 systems (Debian/Ubuntu) without --break-system-packages
-        if ! "$PY" -m venv --clear "$HOME_DIR/venv" >/dev/null 2>&1; then
+        if ! "$PY" -m venv --clear "$HOME_DIR/venv" </dev/null; then
             die "venv oluşturulamadı. Debian/Ubuntu'da: sudo apt install python3-venv (ya da pipx kur)"
         fi
-        "$HOME_DIR/venv/bin/python" -m pip install -q --upgrade "$TARBALL" </dev/null \
+        "$HOME_DIR/venv/bin/python" -m pip install --timeout 30 --upgrade "$pkg" </dev/null \
             || die "pip install başarısız"
         mkdir -p "$BIN_DIR"
         ln -sf "$HOME_DIR/venv/bin/agentcoder" "$BIN_DIR/agentcoder"
         ln -sf "$HOME_DIR/venv/bin/agentcoder-server" "$BIN_DIR/agentcoder-server"
-        info "$HOME_DIR/venv içine kuruldu, $BIN_DIR/agentcoder"
     fi
+    rm -rf "$tmp"
+    info "kuruldu"
 }
 
 ollama_up() { curl -fsS -m 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1; }
