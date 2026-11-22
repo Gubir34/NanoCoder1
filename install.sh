@@ -172,6 +172,8 @@ build_workers() {
     [ "$(uname -s)" = Linux ] && torch_idx=(--index-url https://download.pytorch.org/whl/cpu)
     "$venv/bin/pip" install -q torch "${torch_idx[@]}" </dev/null
     "$venv/bin/pip" install -q transformers peft safetensors sentencepiece protobuf "$llama/gguf-py" </dev/null
+    local log="$HOME_DIR/workers-build.log"
+    info "ayrıntılar: $log"
     (
         cd "$HOME_DIR"
         "$venv/bin/python" "$src/finetune/export_ollama.py" --llama-cpp "$llama" --out "$HOME_DIR/build/w05" \
@@ -180,7 +182,7 @@ build_workers() {
         "$venv/bin/python" "$src/finetune/export_ollama.py" --llama-cpp "$llama" --out "$HOME_DIR/build/w15" \
             --adapter "$src/finetune/adapters/agentcoder-worker-1.5b" \
             --base Qwen/Qwen2.5-Coder-1.5B-Instruct --name agentcoder-worker:1.5b </dev/null
-    ) || die "işçi derlemesi başarısız"
+    ) >"$log" 2>&1 || { tail -n 25 "$log" >&2; die "işçi derlemesi başarısız (tam log: $log)"; }
     rm -rf "$HOME_DIR/build" "$venv"   # Ollama keeps its own copy; torch & merged weights are ~5GB
     WORKERS="small=agentcoder-worker:0.5b,medium=agentcoder-worker:1.5b"
     info "işçiler Ollama'ya eklendi"
