@@ -38,11 +38,26 @@ Dosya okur, arar, düzenler, komut çalıştırır. Bunları yapmadan önce sana
 
 ## Kurulum
 
-```bash
-# 1) Ollama kur: https://ollama.com, sonra bir model çek
-ollama pull qwen2.5-coder:7b
+Tek satır (Linux / macOS):
 
-# 2) agentcoder'ı kur
+```bash
+curl -fsSL https://raw.githubusercontent.com/gubir34/NanoCoder1/main/install.sh | bash
+```
+
+Script her adımda sorar:
+1. `agentcoder` komutunu GitHub'dan kurar (pipx, uv ya da `~/.agentcoder/venv`; root gerekmez, Python 3.9+)
+2. Ollama yoksa kurar (Linux'ta servisin context'ini 32768'e ayarlar)
+3. RAM'e göre şef modelini indirir: 12GB ve üstü `qwen3.5:9b`, altı `qwen2.5-coder:7b`
+4. İstersen fine-tune'lu işçileri (0.5B + 1.5B) derleyip Ollama'ya ekler (~4GB indirme, 10–20 dk)
+5. Seçimleri `~/.agentcoder/config` dosyasına yazar (ortam değişkenleri bunu ezer)
+
+Soru sormadan kurmak için: `... | AGENTCODER_BUILD_WORKERS=y AGENTCODER_PULL=y bash`.
+Diğer ayarlar: `AGENTCODER_INSTALL_OLLAMA=n`, `AGENTCODER_CHEF=qwen3:8b`, `AGENTCODER_REF=<dal>`.
+
+Elle kurulum:
+
+```bash
+ollama pull qwen3.5:9b
 pipx install git+https://github.com/gubir34/NanoCoder1
 # ya da kurmadan çalıştır:
 python3 agentcoder.py
