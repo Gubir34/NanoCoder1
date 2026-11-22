@@ -19,6 +19,7 @@
 
 main() {
     set -euo pipefail
+    export PIP_DISABLE_PIP_VERSION_CHECK=1
     REPO="gubir34/NanoCoder1"
     REF="${AGENTCODER_REF:-main}"
     HOME_DIR="$HOME/.agentcoder"
